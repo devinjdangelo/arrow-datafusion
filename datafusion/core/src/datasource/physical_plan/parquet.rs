@@ -20,6 +20,8 @@
 use crate::datasource::physical_plan::file_stream::{
     FileOpenFuture, FileOpener, FileStream,
 };
+
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use crate::datasource::physical_plan::{
     parquet::page_filter::PagePruningPredicate, DisplayAs, FileMeta, FileScanConfig,
     SchemaAdapter,
@@ -43,6 +45,7 @@ use std::any::Any;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
+use std::io::{Read, Write};
 use tokio::task::JoinSet;
 
 use arrow::datatypes::{DataType, SchemaRef};
@@ -627,6 +630,27 @@ impl ParquetFileReaderFactory for DefaultParquetFileReaderFactory {
     }
 }
 
+struct SyncObjectStoreMultiPartWriter{
+    async_writer: Box<dyn AsyncWrite + Send + Unpin>
+}
+
+impl Write for SyncObjectStoreMultiPartWriter{
+    fn write(&mut self, buf: &[u8]) -> Result<usize, std::io::Error>{
+        futures::executor::block_on( async {
+            self.async_writer.write_all(buf).await.map(|_| buf.len())
+    })
+    }
+
+    fn flush(&mut self) -> Result<(), std::io::Error>{
+        futures::executor::block_on(self.async_writer.flush())
+    }
+}
+
+impl SyncObjectStoreMultiPartWriter{
+    fn into_inner(self) -> Box<dyn AsyncWrite + Send + Unpin>{
+        self.async_writer
+    }
+}
 /// Executes a query and writes the results to a partitioned Parquet file.
 pub async fn plan_to_parquet(
     task_ctx: Arc<TaskContext>,
@@ -639,27 +663,27 @@ pub async fn plan_to_parquet(
     let object_store_url = parsed.object_store();
     let store = task_ctx.runtime_env().object_store(&object_store_url)?;
     let mut join_set = JoinSet::new();
-    let mut buffer;
     for i in 0..plan.output_partitioning().partition_count() {
         let storeref = store.clone();
         let plan: Arc<dyn ExecutionPlan> = plan.clone();
         let filename = format!("{}/part-{i}.parquet", parsed.prefix());
         let file = Path::parse(filename)?;
-        buffer = Vec::new();
+        let (_, async_multipart_writer) = storeref.put_multipart(&file).await?;
+        let sync_writer = SyncObjectStoreMultiPartWriter{async_writer: async_multipart_writer};
         let propclone = writer_properties.clone();
 
         let stream = plan.execute(i, task_ctx.clone())?;
         join_set.spawn(async move {
-            let mut writer = ArrowWriter::try_new(&mut buffer, plan.schema(), propclone)?;
+            let mut writer = ArrowWriter::try_new(sync_writer, plan.schema(), propclone)?;
             stream
                 .map(|batch| writer.write(&batch?).map_err(DataFusionError::ParquetError))
                 .try_collect()
                 .await
                 .map_err(DataFusionError::from)?;
-            writer.close().map_err(DataFusionError::from)?;
-            let write_bytes = Bytes::from_iter(buffer);
-            storeref
-                .put(&file, write_bytes)
+            //take back ownership of multipart writer and finalize the upload
+            let mut async_multipart_writer = writer.into_inner()?.into_inner();
+            async_multipart_writer
+                .shutdown()
                 .await
                 .map_err(DataFusionError::from)
                 .map(|_| ())
