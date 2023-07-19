@@ -18,7 +18,7 @@
 //! Execution plan for reading Parquet files
 
 use crate::datasource::physical_plan::file_stream::{
-    FileOpenFuture, FileOpener, FileStream,
+    FileOpenFuture, FileOpener, FileStream, 
 };
 use crate::datasource::physical_plan::{
     parquet::page_filter::PagePruningPredicate, DisplayAs, FileMeta, FileScanConfig,
@@ -44,6 +44,7 @@ use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
 use tokio::task::JoinSet;
+use tokio::io::AsyncWriteExt;
 
 use arrow::datatypes::{DataType, SchemaRef};
 use arrow::error::ArrowError;
@@ -639,30 +640,58 @@ pub async fn plan_to_parquet(
     let object_store_url = parsed.object_store();
     let store = task_ctx.runtime_env().object_store(&object_store_url)?;
     let mut join_set = JoinSet::new();
-    let mut buffer;
+    let max_rowgroup_rows = match &writer_properties {
+        Some(properties) => properties.max_row_group_size(),
+        None => WriterProperties::default().max_row_group_size()
+    };
     for i in 0..plan.output_partitioning().partition_count() {
         let storeref = store.clone();
         let plan: Arc<dyn ExecutionPlan> = plan.clone();
         let filename = format!("{}/part-{i}.parquet", parsed.prefix());
         let file = Path::parse(filename)?;
-        buffer = Vec::new();
+        
         let propclone = writer_properties.clone();
 
-        let stream = plan.execute(i, task_ctx.clone())?;
+        let mut stream = plan.execute(i, task_ctx.clone())?;
         join_set.spawn(async move {
-            let mut writer = ArrowWriter::try_new(&mut buffer, plan.schema(), propclone)?;
-            stream
-                .map(|batch| writer.write(&batch?).map_err(DataFusionError::ParquetError))
-                .try_collect()
-                .await
-                .map_err(DataFusionError::from)?;
-            writer.close().map_err(DataFusionError::from)?;
-            let write_bytes = Bytes::from_iter(buffer);
-            storeref
-                .put(&file, write_bytes)
-                .await
+            let (_, mut multipart) = storeref.put_multipart(&file).await?;
+            let buffer = Vec::new();
+            
+            let mut propclone2 = propclone.clone();
+            let mut writer = ArrowWriter::try_new(buffer, plan.schema(), propclone2)?;
+            while let Some(batch) = stream.next().await {
+                let record_batch = batch?;
+                let batch_rows = record_batch.num_rows();
+                let buffered_rows = writer.in_progress_rows();
+                println!("Buffered rows: {}", buffered_rows);
+                if batch_rows + buffered_rows < max_rowgroup_rows{
+                    writer.write(&record_batch)?;
+                }  else {
+                    println!("Making new writer!");
+                    let to_write = max_rowgroup_rows - buffered_rows;
+                    let a = record_batch.slice(0, to_write);
+                    writer.write(&a)?;
+                    let out_bytes = Bytes::from_iter(writer.into_inner()?);
+                    multipart
+                    .write_all(&out_bytes)
+                    .await?;
+                    multipart.flush().await?;
+                    let mut out_buffer: Vec<u8> = out_bytes.into();
+                    out_buffer.clear();
+                    propclone2 = propclone.clone();
+                    writer = ArrowWriter::try_new(out_buffer, plan.schema(), propclone2)?;
+                    if batch_rows - to_write > 0{
+                        let b = record_batch.slice(to_write, batch_rows - to_write);
+                        writer.write(&b)?;
+                    }
+                }
+            }
+            multipart
+            .write_all(&Bytes::from_iter(writer.into_inner()?))
+            .await?;
+            multipart.flush().await?;
+            multipart.shutdown().await
                 .map_err(DataFusionError::from)
-                .map(|_| ())
         });
     }
 
