@@ -360,11 +360,6 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                         "Inserts with or clauses not supported".to_owned(),
                     ))?;
                 }
-                if overwrite {
-                    Err(DataFusionError::Plan(
-                        "Insert overwrite is not supported".to_owned(),
-                    ))?;
-                }
                 if partitioned.is_some() {
                     Err(DataFusionError::Plan(
                         "Partitioned inserts not yet supported".to_owned(),
@@ -391,7 +386,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
                     ))?;
                 }
                 let _ = into; // optional keyword doesn't change behavior
-                self.insert_to_plan(table_name, columns, source)
+                self.insert_to_plan(table_name, columns, source, overwrite)
             }
 
             Statement::Update {
@@ -978,6 +973,7 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         table_name: ObjectName,
         columns: Vec<Ident>,
         source: Box<Query>,
+        overwrite: bool,
     ) -> Result<LogicalPlan> {
         // Do a table lookup to verify the table exists
         let table_name = self.object_name_to_table_reference(table_name)?;
@@ -1072,11 +1068,17 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
             })
             .collect::<Result<Vec<datafusion_expr::Expr>>>()?;
         let source = project(source, exprs)?;
-
+        
+        let op;
+        if overwrite{
+            op = WriteOp::InsertOverwrite
+        } else{
+            op = WriteOp::InsertInto
+        }
         let plan = LogicalPlan::Dml(DmlStatement {
             table_name,
             table_schema: Arc::new(table_schema),
-            op: WriteOp::Insert,
+            op,
             input: Arc::new(source),
         });
         Ok(plan)
