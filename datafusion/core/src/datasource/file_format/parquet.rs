@@ -17,7 +17,8 @@
 
 //! Parquet format abstractions
 
-use parquet::arrow::arrow_writer::ArrowRowGroupWriter;
+use parquet::arrow::arrow_writer::levels::calculate_array_levels;
+use parquet::arrow::arrow_writer::{ArrowRowGroupWriter, write_leaves};
 use parquet::column::writer::ColumnCloseResult;
 use parquet::file::writer::SerializedFileWriter;
 use rand::distributions::DistString;
@@ -865,12 +866,17 @@ async fn output_single_parquet_file_parallelized(
                     &arc_props_clone,
                     &schema_clone,
                 )?;
+   
                 serialize_tx
                     .send(tokio::spawn(async move {
                         let mut inner_row_count = 0;
                         while let Some(rb) = stream.next().await.transpose()? {
                             inner_row_count += rb.num_rows();
-                            writer.write(&rb)?;
+                            // writer.write(&rb)?;
+                            for (array, field) in rb.columns().iter().zip(&writer.schema().fields) {
+                                let mut levels = calculate_array_levels(array, field)?.into_iter();
+                                write_leaves(&mut writers, &mut levels, array.as_ref())?;
+                            }
                         }
                         Ok((writer.close()?, inner_row_count))
                     }))
