@@ -18,11 +18,12 @@
 //! Parquet format abstractions
 
 use parquet::arrow::arrow_writer::levels::calculate_array_levels;
-use parquet::arrow::arrow_writer::{ArrowRowGroupWriter, write_leaves};
+use parquet::arrow::arrow_writer::{ArrowRowGroupWriter, write_leaves, ArrowColumnWriter};
 use parquet::column::writer::ColumnCloseResult;
 use parquet::file::writer::SerializedFileWriter;
 use rand::distributions::DistString;
 use std::any::Any;
+use std::collections::VecDeque;
 use std::fmt;
 use std::fmt::Debug;
 use std::io::Write;
@@ -797,7 +798,7 @@ impl DataSink for ParquetSink {
                 row_count = output_multiple_parquet_files(writers, data).await?;
             }
             true => {
-                if !allow_single_file_parallelism || data.len() <= 1 {
+                if !allow_single_file_parallelism {
                     let mut writer = self
                         .create_all_async_arrow_writers(
                             num_partitions,
@@ -840,8 +841,8 @@ type RBStreamSerializeResult =
     Result<(Vec<(ArrowColumnChunk, ColumnCloseResult)>, usize)>;
 
 /// Parallelizes the serialization of a single parquet file, by first serializing N
-/// independent RecordBatch streams in parallel to parquet files in memory. Another
-/// task then stitches these independent files back together and streams this large
+/// independent RecordBatch streams in parallel to RowGroups in memory. Another
+/// task then stitches these independent RowGroups together and streams this large
 /// single parquet file to an ObjectStore in multiple parts.
 async fn output_single_parquet_file_parallelized(
     mut object_store_writer: AbortableWrite<Box<dyn AsyncWrite + Send + Unpin>>,
@@ -861,24 +862,68 @@ async fn output_single_parquet_file_parallelized(
         tokio::spawn(async move {
             for mut stream in data {
                 let schema_desc = arrow_to_parquet_schema(&schema_clone)?;
-                let mut writer = ArrowRowGroupWriter::new(
+                let row_group_writer = ArrowRowGroupWriter::new(
                     &schema_desc,
                     &arc_props_clone,
                     &schema_clone,
                 )?;
-   
+
+                let fields = row_group_writer.schema().fields().clone();               
+                let schema_col_clone = schema_clone.clone();
                 serialize_tx
                     .send(tokio::spawn(async move {
                         let mut inner_row_count = 0;
+                        let col_chunks_and_writers = row_group_writer.into_col_writers();
+
+                        let (col_chunks, mut col_writers): (Vec<_>, VecDeque<_>) = col_chunks_and_writers
+                            .into_iter()
+                            .unzip();
+
                         while let Some(rb) = stream.next().await.transpose()? {
+                            let mut column_join_handles: Vec<JoinHandle<Result<ArrowColumnWriter, DataFusionError>>> = Vec::with_capacity(schema_col_clone.fields().len());
                             inner_row_count += rb.num_rows();
-                            // writer.write(&rb)?;
-                            for (array, field) in rb.columns().iter().zip(&writer.schema().fields) {
-                                let mut levels = calculate_array_levels(array, field)?.into_iter();
-                                write_leaves(&mut writers, &mut levels, array.as_ref())?;
+                            // does this actualy clone values?
+                            let rb_clone = rb.clone();
+
+
+                            for (array, field) in rb_clone.columns()
+                                .iter()
+                                .zip(&fields){
+                                let field_clone = field.clone();
+                                let array_clone = array.clone();
+                                let mut col_writer = col_writers.pop_front()
+                                    .ok_or(DataFusionError::Internal("Number of ArrowColumnWriters should always equal number of columns!".into()))?;
+                                column_join_handles.push(tokio::spawn(async move {
+                                    let mut levels = calculate_array_levels(&array_clone, &field_clone)?.into_iter();
+                                    let mut writer_iter = std::iter::once(&mut col_writer);
+                                    write_leaves(&mut writer_iter, &mut levels, array_clone.as_ref())?;
+                                    Ok(col_writer)
+                                }));
+                            }
+
+                            for handle in column_join_handles{
+                                match handle.await{
+                                    Ok(r) => {
+                                        let writer = r?;
+                                        col_writers.push_back(writer);
+
+                                    },
+                                    Err(e) => {
+                                        if e.is_panic() {
+                                            std::panic::resume_unwind(e.into_panic());
+                                        } else {
+                                            unreachable!();
+                                        }
+                                    }
+                                }
                             }
                         }
-                        Ok((writer.close()?, inner_row_count))
+                        let col_chunks_and_writers: Vec<_> = col_chunks
+                            .into_iter()
+                            .zip(col_writers)
+                            .collect();
+                        let row_group_writer = ArrowRowGroupWriter::from((schema_col_clone, col_chunks_and_writers));
+                        Ok((row_group_writer.close()?, inner_row_count))
                     }))
                     .await
                     .map_err(|_| {
