@@ -890,7 +890,7 @@ fn spawn_column_parallel_row_group_writer(
     let mut col_writer_handles = Vec::with_capacity(num_columns);
     let mut col_array_channels = Vec::with_capacity(num_columns);
     for (field, writer) in fields.iter().zip(col_writers) {
-        let (send_array, recieve_array) = mpsc::channel::<ArrayRef>(99999);
+        let (send_array, recieve_array) = mpsc::channel::<ArrayRef>(9999999);
         col_array_channels.push(send_array);
         col_writer_handles.push(tokio::spawn(column_serializer_task(
             recieve_array,
@@ -933,6 +933,7 @@ fn spawn_rg_join_and_finalize_task(
     tokio::spawn(async move {
         let num_cols = column_writer_handles.len();
         let mut joined_writers = Vec::with_capacity(num_cols);
+        println!("Joining Column Handles!");
         for handle in column_writer_handles.into_iter() {
             match handle.await {
                 Ok(r) => {
@@ -954,6 +955,7 @@ fn spawn_rg_join_and_finalize_task(
             ArrowRowGroupWriter::from((schema, col_chunks_and_writers));
 
         let finalized_rg = (row_group_writer.close()?, rg_rows);
+        println!("Rg done!");
         Ok(finalized_rg)
     })
 }
@@ -966,7 +968,7 @@ fn parallel_await_rb_streams(data: Vec<SendableRecordBatchStream>) -> (Vec<JoinH
     let mut recievers = Vec::with_capacity(data.len());
     let mut handles = Vec::with_capacity(data.len());
     for mut stream in data{
-        let (tx, rx) = mpsc::channel(10000);
+        let (tx, rx) = mpsc::channel(9999999);
         recievers.push(rx);
         handles.push(tokio::spawn(
             async move {
@@ -1083,7 +1085,9 @@ async fn concatenate_parallel_row_groups(
     let mut row_count = 0;
 
     while let Some(handle) = serialize_rx.recv().await {
+        println!("Got rg join handlein concat!");
         let join_result = handle.await;
+        println!("Got rg in concat task!");
         match join_result {
             Ok(result) => {
                 let mut rg_out = parquet_writer.next_row_group()?;
@@ -1131,7 +1135,7 @@ async fn output_single_parquet_file_parallelized(
     parquet_props: &WriterProperties,
 ) -> Result<usize> {
     let (serialize_tx, serialize_rx) =
-        mpsc::channel::<JoinHandle<RBStreamSerializeResult>>(1000);
+        mpsc::channel::<JoinHandle<RBStreamSerializeResult>>(9999);
 
     let arc_props = Arc::new(parquet_props.clone());
     let launch_serialization_task = spawn_parquet_parallel_serialization_task(
@@ -1160,6 +1164,7 @@ async fn output_single_parquet_file_parallelized(
         }
     };
 
+    println!("Final row count: {row_count}");
     Ok(row_count)
 }
 
