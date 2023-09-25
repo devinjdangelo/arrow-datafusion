@@ -17,8 +17,12 @@
 
 //! Parquet format abstractions
 
+use arrow_array::{ArrayRef, RecordBatch};
+use arrow_schema::Field;
 use parquet::arrow::arrow_writer::levels::calculate_array_levels;
-use parquet::arrow::arrow_writer::{ArrowRowGroupWriter, write_leaves, ArrowColumnWriter};
+use parquet::arrow::arrow_writer::{
+    write_leaves, ArrowColumnWriter, ArrowRowGroupWriter,
+};
 use parquet::column::writer::ColumnCloseResult;
 use parquet::file::writer::SerializedFileWriter;
 use rand::distributions::DistString;
@@ -28,8 +32,9 @@ use std::fmt;
 use std::fmt::Debug;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::{JoinHandle, JoinSet};
 
 use crate::datasource::file_format::file_compression_type::FileCompressionType;
@@ -785,17 +790,26 @@ impl DataSink for ParquetSink {
 
         match self.config.single_file_output {
             false => {
-                let writers = self
-                    .create_all_async_arrow_writers(
-                        num_partitions,
+                if !allow_single_file_parallelism {
+                    let writers = self
+                        .create_all_async_arrow_writers(
+                            num_partitions,
+                            parquet_props,
+                            object_store.clone(),
+                        )
+                        .await?;
+                    row_count = output_multiple_parquet_files(writers, data).await?;
+                } else {
+                    let object_store_writers =
+                        self.create_object_store_writers(1, object_store).await?;
+                    row_count = output_multiple_parquet_files_parallelized(
+                        object_store_writers,
+                        data,
+                        self.config.output_schema.clone(),
                         parquet_props,
-                        object_store.clone(),
                     )
                     .await?;
-                // TODO parallelize individual parquet serialization when already outputting multiple parquet files
-                // e.g. if outputting 2 parquet files on a system with 32 threads, spawn 16 tasks for each individual
-                // file to be serialized.
-                row_count = output_multiple_parquet_files(writers, data).await?;
+                }
             }
             true => {
                 if !allow_single_file_parallelism {
@@ -835,114 +849,197 @@ impl DataSink for ParquetSink {
     }
 }
 
+/// Consumes a stream of [ArrayRef] via a channel and serializes them using an [ArrowColumnWriter]
+/// Once the channel is exhausted, returns the ArrowColumnWriter.
+async fn column_serializer_task(
+    mut rx: Receiver<ArrayRef>,
+    mut writer: ArrowColumnWriter,
+    field: Arc<Field>,
+) -> Result<ArrowColumnWriter> {
+    while let Some(array) = rx.recv().await {
+        let mut levels = calculate_array_levels(&array, &field)?.into_iter();
+        let mut writer_iter = std::iter::once(&mut writer);
+        write_leaves(&mut writer_iter, &mut levels, array.as_ref())?;
+    }
+    Ok(writer)
+}
+
+/// Creates an [ArrowRowGroupWriter] and spawns a parallel serialization task for each column
+/// Returns join handles for each columns serialization task along with a send channel
+/// to send arrow arrays to each serialization task.
+fn spawn_column_parallel_row_group_writer(
+    schema: Arc<Schema>,
+    parquet_props: Arc<WriterProperties>,
+) -> Result<(
+    Vec<JoinHandle<Result<ArrowColumnWriter>>>,
+    Vec<Sender<ArrayRef>>,
+    Vec<Arc<Mutex<ArrowColumnChunk>>>,
+)> {
+    let schema_desc = arrow_to_parquet_schema(&schema)?;
+    let row_group_writer =
+        ArrowRowGroupWriter::new(&schema_desc, &parquet_props, &schema)?;
+    let fields = row_group_writer.schema().fields().clone();
+
+    let col_chunks_and_writers = row_group_writer.into_col_writers();
+
+    let (col_chunks, col_writers): (Vec<_>, VecDeque<_>) =
+        col_chunks_and_writers.into_iter().unzip();
+
+    let num_columns = col_writers.len();
+
+    let mut col_writer_handles = Vec::with_capacity(num_columns);
+    let mut col_array_channels = Vec::with_capacity(num_columns);
+    for (field, writer) in fields.iter().zip(col_writers) {
+        let (send_array, recieve_array) = mpsc::channel::<ArrayRef>(99999);
+        col_array_channels.push(send_array);
+        col_writer_handles.push(tokio::spawn(column_serializer_task(
+            recieve_array,
+            writer,
+            field.clone(),
+        )))
+    }
+
+    Ok((col_writer_handles, col_array_channels, col_chunks))
+}
+
 /// This is the return type of ArrowRowGroupWriter.close(), i.e. the Vec of
 /// encoded columns which can be appended to a SerializedRowGroupWriter
 type RBStreamSerializeResult =
     Result<(Vec<(ArrowColumnChunk, ColumnCloseResult)>, usize)>;
 
-/// Parallelizes the serialization of a single parquet file, by first serializing N
-/// independent RecordBatch streams in parallel to RowGroups in memory. Another
-/// task then stitches these independent RowGroups together and streams this large
-/// single parquet file to an ObjectStore in multiple parts.
-async fn output_single_parquet_file_parallelized(
-    mut object_store_writer: AbortableWrite<Box<dyn AsyncWrite + Send + Unpin>>,
+/// Sends the ArrowArrays in passed [RecordBatch] through the channels to their respective
+/// parallel column serializers.
+async fn send_arrays_to_col_writers(
+    col_array_channels: &Vec<Sender<ArrayRef>>,
+    rb: &RecordBatch,
+) -> Result<()> {
+    for (tx, array) in col_array_channels.iter().zip(rb.columns()) {
+        tx.send(array.clone()).await.map_err(|_| {
+            DataFusionError::Internal("Unable to send array to writer!".into())
+        })?;
+    }
+
+    Ok(())
+}
+
+/// Spawns a tokio task which joins the parallel column writer tasks,
+/// reconstructs [ArrowRowGroupWriter] and finalizes the rg.
+fn spawn_rg_join_and_finalize_task(
+    column_writer_handles: Vec<JoinHandle<Result<ArrowColumnWriter>>>,
+    col_chunks: Vec<Arc<Mutex<ArrowColumnChunk>>>,
+    schema: Arc<Schema>,
+    rg_rows: usize,
+) -> JoinHandle<Result<(Vec<(ArrowColumnChunk, ColumnCloseResult)>, usize)>> {
+    tokio::spawn(async move {
+        let num_cols = column_writer_handles.len();
+        let mut joined_writers = Vec::with_capacity(num_cols);
+        for handle in column_writer_handles.into_iter() {
+            match handle.await {
+                Ok(r) => {
+                    let w = r?;
+                    joined_writers.push(w);
+                }
+                Err(e) => {
+                    if e.is_panic() {
+                        std::panic::resume_unwind(e.into_panic())
+                    } else {
+                        unreachable!()
+                    }
+                }
+            }
+        }
+        let col_chunks_and_writers: Vec<_> =
+            col_chunks.into_iter().zip(joined_writers).collect();
+        let row_group_writer =
+            ArrowRowGroupWriter::from((schema, col_chunks_and_writers));
+
+        let finalized_rg = (row_group_writer.close()?, rg_rows);
+        Ok(finalized_rg)
+    })
+}
+
+/// This task coordinates the serialization of a parquet file in parallel.
+/// As the query produces RecordBatches, these are written to a RowGroup
+/// via parallel [ArrowColumnWriter] tasks. Once the desired max rows per
+/// row group is reached, the parallel tasks are joined on another separate task
+/// and sent to a concatenation task. This task immediately continues to work
+/// on the next row group in parallel. So, parquet serialization is parallelized
+/// accross both columns and row_groups, with a theoretical max number of parallel tasks
+/// given by n_columns * num_row_groups.
+fn spawn_parquet_parallel_serialization_task(
     data: Vec<SendableRecordBatchStream>,
-    output_schema: Arc<Schema>,
-    parquet_props: &WriterProperties,
-) -> Result<usize> {
-    let mut row_count = 0;
-    let (serialize_tx, mut serialize_rx) =
-        mpsc::channel::<JoinHandle<RBStreamSerializeResult>>(100);
+    serialize_tx: Sender<
+        JoinHandle<Result<(Vec<(ArrowColumnChunk, ColumnCloseResult)>, usize)>>,
+    >,
+    schema: Arc<Schema>,
+    writer_props: Arc<WriterProperties>,
+) -> JoinHandle<Result<(), DataFusionError>> {
+    tokio::spawn(async move {
+        let max_row_group_rows = writer_props.max_row_group_size();
+        let (mut column_writer_handles, mut col_array_channels, mut col_chunks) =
+            spawn_column_parallel_row_group_writer(schema.clone(), writer_props.clone())?;
+        let mut current_rg_rows = 0;
+        for mut stream in data {
+            while let Some(rb) = stream.next().await.transpose()? {
+                if current_rg_rows + rb.num_rows() < max_row_group_rows {
+                    send_arrays_to_col_writers(&col_array_channels, &rb).await?;
+                    current_rg_rows += rb.num_rows();
+                } else {
+                    let rows_left = max_row_group_rows - current_rg_rows;
+                    let a = rb.slice(0, rows_left);
+                    send_arrays_to_col_writers(&col_array_channels, &a).await?;
 
-    // Create some Arc<> copies that we can move into launch_serialization task and still access later
-    let arc_props = Arc::new(parquet_props.clone());
-    let arc_props_clone = arc_props.clone();
-    let schema_clone = output_schema.clone();
-    let launch_serialization_task: JoinHandle<Result<(), DataFusionError>> =
-        tokio::spawn(async move {
-            for mut stream in data {
-                let schema_desc = arrow_to_parquet_schema(&schema_clone)?;
-                let row_group_writer = ArrowRowGroupWriter::new(
-                    &schema_desc,
-                    &arc_props_clone,
-                    &schema_clone,
-                )?;
+                    // Signal the parallel column writers that the RowGroup is done, join and finalize RowGroup
+                    // on a separate task, so that we can immediately start on the next RG before waiting
+                    // for the current on to finish.
+                    drop(col_array_channels);
+                    let finalize_rg_task = spawn_rg_join_and_finalize_task(
+                        column_writer_handles,
+                        col_chunks,
+                        schema.clone(),
+                        current_rg_rows,
+                    );
 
-                let fields = row_group_writer.schema().fields().clone();               
-                let schema_col_clone = schema_clone.clone();
-                serialize_tx
-                    .send(tokio::spawn(async move {
-                        let mut inner_row_count = 0;
-                        let col_chunks_and_writers = row_group_writer.into_col_writers();
-
-                        let (col_chunks, mut col_writers): (Vec<_>, VecDeque<_>) = col_chunks_and_writers
-                            .into_iter()
-                            .unzip();
-
-                        while let Some(rb) = stream.next().await.transpose()? {
-                            let mut column_join_handles: Vec<JoinHandle<Result<ArrowColumnWriter, DataFusionError>>> = Vec::with_capacity(schema_col_clone.fields().len());
-                            inner_row_count += rb.num_rows();
-                            // does this actualy clone values?
-                            let rb_clone = rb.clone();
-
-
-                            for (array, field) in rb_clone.columns()
-                                .iter()
-                                .zip(&fields){
-                                let field_clone = field.clone();
-                                let array_clone = array.clone();
-                                let mut col_writer = col_writers.pop_front()
-                                    .ok_or(DataFusionError::Internal("Number of ArrowColumnWriters should always equal number of columns!".into()))?;
-                                column_join_handles.push(tokio::spawn(async move {
-                                    let mut levels = calculate_array_levels(&array_clone, &field_clone)?.into_iter();
-                                    let mut writer_iter = std::iter::once(&mut col_writer);
-                                    write_leaves(&mut writer_iter, &mut levels, array_clone.as_ref())?;
-                                    Ok(col_writer)
-                                }));
-                            }
-
-                            for handle in column_join_handles{
-                                match handle.await{
-                                    Ok(r) => {
-                                        let writer = r?;
-                                        col_writers.push_back(writer);
-
-                                    },
-                                    Err(e) => {
-                                        if e.is_panic() {
-                                            std::panic::resume_unwind(e.into_panic());
-                                        } else {
-                                            unreachable!();
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        let col_chunks_and_writers: Vec<_> = col_chunks
-                            .into_iter()
-                            .zip(col_writers)
-                            .collect();
-                        let row_group_writer = ArrowRowGroupWriter::from((schema_col_clone, col_chunks_and_writers));
-                        Ok((row_group_writer.close()?, inner_row_count))
-                    }))
-                    .await
-                    .map_err(|_| {
+                    serialize_tx.send(finalize_rg_task).await.map_err(|_| {
                         DataFusionError::Internal(
-                            "Error sending encoded row group to concat task!".into(),
+                            "Unable to send closed RG to concat task!".into(),
                         )
                     })?;
-            }
-            Ok(())
-        });
 
+                    let b = rb.slice(rows_left, rb.num_rows() - rows_left);
+                    (column_writer_handles, col_array_channels, col_chunks) =
+                        spawn_column_parallel_row_group_writer(
+                            schema.clone(),
+                            writer_props.clone(),
+                        )?;
+                    send_arrays_to_col_writers(&col_array_channels, &b).await?;
+                }
+            }
+        }
+        Ok(())
+    })
+}
+
+/// Consume RowGroups serialized by other parallel tasks and concatenate them in
+/// to the final parquet file, while flushing finalized bytes to an [ObjectStore]
+async fn concatenate_parallel_row_groups(
+    mut serialize_rx: Receiver<
+        JoinHandle<Result<(Vec<(ArrowColumnChunk, ColumnCloseResult)>, usize)>>,
+    >,
+    schema: Arc<Schema>,
+    writer_props: Arc<WriterProperties>,
+    mut object_store_writer: AbortableWrite<Box<dyn AsyncWrite + Send + Unpin>>,
+) -> Result<usize> {
     let merged_buff = SharedBuffer::new(1048576);
 
-    let schema_desc = arrow_to_parquet_schema(&output_schema)?;
+    let schema_desc = arrow_to_parquet_schema(schema.as_ref())?;
     let mut parquet_writer = SerializedFileWriter::new(
         merged_buff.clone(),
         schema_desc.root_schema_ptr(),
-        arc_props,
+        writer_props,
     )?;
+
+    let mut row_count = 0;
 
     while let Some(handle) = serialize_rx.recv().await {
         let join_result = handle.await;
@@ -979,21 +1076,99 @@ async fn output_single_parquet_file_parallelized(
     object_store_writer.write_all(final_buff.as_slice()).await?;
     object_store_writer.shutdown().await?;
 
+    Ok(row_count)
+}
+
+/// Parallelizes the serialization of a single parquet file, by first serializing N
+/// independent RecordBatch streams in parallel to RowGroups in memory. Another
+/// task then stitches these independent RowGroups together and streams this large
+/// single parquet file to an ObjectStore in multiple parts.
+async fn output_single_parquet_file_parallelized(
+    object_store_writer: AbortableWrite<Box<dyn AsyncWrite + Send + Unpin>>,
+    data: Vec<SendableRecordBatchStream>,
+    output_schema: Arc<Schema>,
+    parquet_props: &WriterProperties,
+) -> Result<usize> {
+    let (serialize_tx, serialize_rx) =
+        mpsc::channel::<JoinHandle<RBStreamSerializeResult>>(1000);
+
+    let arc_props = Arc::new(parquet_props.clone());
+    let launch_serialization_task = spawn_parquet_parallel_serialization_task(
+        data,
+        serialize_tx,
+        output_schema.clone(),
+        arc_props.clone(),
+    );
+    let row_count = concatenate_parallel_row_groups(
+        serialize_rx,
+        output_schema.clone(),
+        arc_props.clone(),
+        object_store_writer,
+    )
+    .await?;
+
     match launch_serialization_task.await {
         Ok(Ok(_)) => (),
         Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            return Err(DataFusionError::Internal(
-                "Unknown error writing to object store".into(),
-            ))
+        Err(e) => {
+            if e.is_panic() {
+                std::panic::resume_unwind(e.into_panic())
+            } else {
+                unreachable!()
+            }
         }
     };
 
     Ok(row_count)
 }
 
+/// Serializes multiple parquet files in parallel using [`output_single_parquet_file_parallelized`]
+/// to coordinate writing each file in parallel in terms of RowGroups and Columns.
+/// The maximum possible parallelism is n_output_files * n_row_groups_per_file * columns_per_file.
+async fn output_multiple_parquet_files_parallelized(
+    object_store_writers: Vec<AbortableWrite<Box<dyn AsyncWrite + Send + Unpin>>>,
+    data: Vec<SendableRecordBatchStream>,
+    schema: Arc<Schema>,
+    writer_properties: &WriterProperties,
+) -> Result<usize> {
+    let mut row_count = 0;
+    let mut join_set: JoinSet<Result<usize, DataFusionError>> = JoinSet::new();
+    for (data_stream, writer) in
+        data.into_iter().zip(object_store_writers.into_iter())
+    {
+        let schema_clone = schema.clone();
+        let props_clone = writer_properties.clone();
+        join_set.spawn(async move {
+            let data_stream = vec![data_stream];
+            output_single_parquet_file_parallelized(
+                writer,
+                data_stream,
+                schema_clone,
+                &props_clone,
+            )
+            .await
+        });
+    }
+    while let Some(result) = join_set.join_next().await {
+        match result {
+            Ok(res) => {
+                row_count += res?;
+            } 
+            Err(e) => {
+                if e.is_panic() {
+                    std::panic::resume_unwind(e.into_panic());
+                } else {
+                    unreachable!();
+                }
+            }
+        }
+    }
+
+    Ok(row_count)
+}
+
 /// Serializes multiple parquet files independently in parallel from different RecordBatch streams.
-/// AsyncArrowWriter is used to coordinate serialization and MultiPart puts to ObjectStore
+/// [AsyncArrowWriter] is used to coordinate serialization and MultiPart puts to [ObjectStore]
 /// Only a single CPU thread is used to serialize each individual parquet file, so write speed and overall
 /// CPU utilization is dependent on the number of output files.
 async fn output_multiple_parquet_files(
