@@ -958,6 +958,31 @@ fn spawn_rg_join_and_finalize_task(
     })
 }
 
+/// Awaits Vec of streams in parallel and buffers the [RecordBatch]s into a channel.
+/// This allows parquet serializer to consume the RecordBatches in order, but still
+/// allow the plan to execute in parallel upstream.
+fn parallel_await_rb_streams(data: Vec<SendableRecordBatchStream>) -> (Vec<JoinHandle<Result<()>>>, Vec<Receiver<RecordBatch>>){
+    
+    let mut recievers = Vec::with_capacity(data.len());
+    let mut handles = Vec::with_capacity(data.len());
+    for mut stream in data{
+        let (tx, rx) = mpsc::channel(10000);
+        recievers.push(rx);
+        handles.push(tokio::spawn(
+            async move {
+                while let Some(rb) = stream.next().await.transpose()?{
+                    tx.send(rb).await
+                        .map_err(|_| DataFusionError::Internal("Unable to send record batch to parallel row group writers!".into()))?;
+                }
+            Ok(())
+            }
+        ))
+    }
+
+    (handles, recievers)
+    
+}
+
 /// This task coordinates the serialization of a parquet file in parallel.
 /// As the query produces RecordBatches, these are written to a RowGroup
 /// via parallel [ArrowColumnWriter] tasks. Once the desired max rows per
@@ -979,8 +1004,9 @@ fn spawn_parquet_parallel_serialization_task(
         let (mut column_writer_handles, mut col_array_channels, mut col_chunks) =
             spawn_column_parallel_row_group_writer(schema.clone(), writer_props.clone())?;
         let mut current_rg_rows = 0;
-        for mut stream in data {
-            while let Some(rb) = stream.next().await.transpose()? {
+        let (stream_await_handles, rb_recievers) = parallel_await_rb_streams(data);
+        for mut rx in rb_recievers {
+            while let Some(rb) = rx.recv().await {
                 if current_rg_rows + rb.num_rows() < max_row_group_rows {
                     send_arrays_to_col_writers(&col_array_channels, &rb).await?;
                     current_rg_rows += rb.num_rows();
@@ -989,6 +1015,7 @@ fn spawn_parquet_parallel_serialization_task(
                     let a = rb.slice(0, rows_left);
                     send_arrays_to_col_writers(&col_array_channels, &a).await?;
 
+                    println!("making new rowgroup!");
                     // Signal the parallel column writers that the RowGroup is done, join and finalize RowGroup
                     // on a separate task, so that we can immediately start on the next RG before waiting
                     // for the current on to finish.
@@ -1013,6 +1040,20 @@ fn spawn_parquet_parallel_serialization_task(
                             writer_props.clone(),
                         )?;
                     send_arrays_to_col_writers(&col_array_channels, &b).await?;
+                    current_rg_rows = b.num_rows();
+                }
+            }
+        }
+
+        for handle in stream_await_handles{
+            match handle.await{
+                Ok(r) => r?,
+                Err(e) => {
+                    if e.is_panic(){
+                        std::panic::resume_unwind(e.into_panic())
+                    } else{
+                        unreachable!()
+                    }
                 }
             }
         }
