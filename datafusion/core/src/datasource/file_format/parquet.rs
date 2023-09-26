@@ -741,7 +741,7 @@ impl ParquetSink {
 
         let write_id = Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
         for part_idx in 0..num_partitions {
-            let file_path = if !single_file_output{
+            let file_path = if !single_file_output {
                 self.config.table_paths[0]
                     .prefix()
                     .child(format!("{}_{}.parquet", write_id, part_idx))
@@ -810,8 +810,9 @@ impl DataSink for ParquetSink {
                         max_buffered_record_batches_per_stream: parquet_opts
                             .maximum_buffered_record_batches_per_stream,
                     };
-                    let object_store_writers =
-                        self.create_object_store_writers(num_partitions, object_store, false).await?;
+                    let object_store_writers = self
+                        .create_object_store_writers(num_partitions, object_store, false)
+                        .await?;
                     row_count = output_multiple_parquet_files_parallelized(
                         object_store_writers,
                         data,
