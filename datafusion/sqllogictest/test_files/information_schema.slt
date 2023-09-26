@@ -151,7 +151,7 @@ datafusion.execution.batch_size 8192
 datafusion.execution.coalesce_batches true
 datafusion.execution.collect_statistics false
 datafusion.execution.meta_fetch_concurrency 32
-datafusion.execution.parquet.allow_single_file_parallelism false
+datafusion.execution.parquet.allow_single_file_parallelism true
 datafusion.execution.parquet.bloom_filter_enabled false
 datafusion.execution.parquet.bloom_filter_fpp NULL
 datafusion.execution.parquet.bloom_filter_ndv NULL
@@ -166,6 +166,8 @@ datafusion.execution.parquet.enable_page_index true
 datafusion.execution.parquet.encoding NULL
 datafusion.execution.parquet.max_row_group_size 1048576
 datafusion.execution.parquet.max_statistics_size NULL
+datafusion.execution.parquet.maximum_buffered_record_batches_per_stream 200
+datafusion.execution.parquet.maximum_parallel_row_group_writers 16
 datafusion.execution.parquet.metadata_size_hint NULL
 datafusion.execution.parquet.pruning true
 datafusion.execution.parquet.pushdown_filters false
