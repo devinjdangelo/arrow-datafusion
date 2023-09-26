@@ -19,20 +19,15 @@
 
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::Field;
-use parquet::arrow::arrow_writer::levels::calculate_array_levels;
-use parquet::arrow::arrow_writer::{
-    write_leaves, ArrowColumnWriter, ArrowRowGroupWriter,
-};
+use parquet::arrow::arrow_writer::{ArrowColumnWriter, ArrowRowGroupWriter};
 use parquet::column::writer::ColumnCloseResult;
 use parquet::file::writer::SerializedFileWriter;
 use rand::distributions::DistString;
 use std::any::Any;
-use std::collections::VecDeque;
 use std::fmt;
 use std::fmt::Debug;
 use std::io::Write;
 use std::sync::Arc;
-use std::sync::Mutex;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio::task::{JoinHandle, JoinSet};
@@ -876,17 +871,13 @@ async fn column_serializer_task(
     field: Arc<Field>,
 ) -> Result<ArrowColumnWriter> {
     while let Some(array) = rx.recv().await {
-        let mut levels = calculate_array_levels(&array, &field)?.into_iter();
-        let mut writer_iter = std::iter::once(&mut writer);
-        write_leaves(&mut writer_iter, &mut levels, array.as_ref())?;
+        writer.write(array, field.clone())?;
     }
     Ok(writer)
 }
 
 type ColumnJoinHandle = JoinHandle<Result<ArrowColumnWriter>>;
 type ArraySender = Sender<ArrayRef>;
-type ColumnChunk = Arc<Mutex<ArrowColumnChunk>>;
-
 /// Creates an [ArrowRowGroupWriter] and spawns a parallel serialization task for each column
 /// Returns join handles for each columns serialization task along with a send channel
 /// to send arrow arrays to each serialization task.
@@ -894,16 +885,13 @@ fn spawn_column_parallel_row_group_writer(
     schema: Arc<Schema>,
     parquet_props: Arc<WriterProperties>,
     max_buffer_size: usize,
-) -> Result<(Vec<ColumnJoinHandle>, Vec<ArraySender>, Vec<ColumnChunk>)> {
+) -> Result<(Vec<ColumnJoinHandle>, Vec<ArraySender>, ArrowRowGroupWriter)> {
     let schema_desc = arrow_to_parquet_schema(&schema)?;
-    let row_group_writer =
+    let mut row_group_writer =
         ArrowRowGroupWriter::new(&schema_desc, &parquet_props, &schema)?;
     let fields = row_group_writer.schema().fields().clone();
 
-    let col_chunks_and_writers = row_group_writer.into_col_writers();
-
-    let (col_chunks, col_writers): (Vec<_>, VecDeque<_>) =
-        col_chunks_and_writers.into_iter().unzip();
+    let col_writers = row_group_writer.take_col_writers();
 
     let num_columns = col_writers.len();
 
@@ -920,7 +908,7 @@ fn spawn_column_parallel_row_group_writer(
         )))
     }
 
-    Ok((col_writer_handles, col_array_channels, col_chunks))
+    Ok((col_writer_handles, col_array_channels, row_group_writer))
 }
 
 /// Settings related to writing parquet files in parallel
@@ -954,8 +942,7 @@ async fn send_arrays_to_col_writers(
 /// reconstructs [ArrowRowGroupWriter] and finalizes the rg.
 fn spawn_rg_join_and_finalize_task(
     column_writer_handles: Vec<JoinHandle<Result<ArrowColumnWriter>>>,
-    col_chunks: Vec<Arc<Mutex<ArrowColumnChunk>>>,
-    schema: Arc<Schema>,
+    mut row_group_writer: ArrowRowGroupWriter,
     rg_rows: usize,
 ) -> JoinHandle<RBStreamSerializeResult> {
     tokio::spawn(async move {
@@ -976,10 +963,8 @@ fn spawn_rg_join_and_finalize_task(
                 }
             }
         }
-        let col_chunks_and_writers: Vec<_> =
-            col_chunks.into_iter().zip(joined_writers).collect();
-        let row_group_writer =
-            ArrowRowGroupWriter::from((schema, col_chunks_and_writers));
+
+        row_group_writer.give_col_writers(joined_writers);
 
         let finalized_rg = (row_group_writer.close()?, rg_rows);
         Ok(finalized_rg)
@@ -1036,7 +1021,7 @@ fn spawn_parquet_parallel_serialization_task(
         // buffer limit is the sum of the size of each buffer, i.e. when both buffers are full.
         let max_buffer_rb = parallel_options.max_buffered_record_batches_per_stream / 2;
         let max_row_group_rows = writer_props.max_row_group_size();
-        let (mut column_writer_handles, mut col_array_channels, mut col_chunks) =
+        let (mut column_writer_handles, mut col_array_channels, mut row_group_writer) =
             spawn_column_parallel_row_group_writer(
                 schema.clone(),
                 writer_props.clone(),
@@ -1061,8 +1046,7 @@ fn spawn_parquet_parallel_serialization_task(
                     drop(col_array_channels);
                     let finalize_rg_task = spawn_rg_join_and_finalize_task(
                         column_writer_handles,
-                        col_chunks,
-                        schema.clone(),
+                        row_group_writer,
                         max_row_group_rows,
                     );
 
@@ -1073,7 +1057,7 @@ fn spawn_parquet_parallel_serialization_task(
                     })?;
 
                     let b = rb.slice(rows_left, rb.num_rows() - rows_left);
-                    (column_writer_handles, col_array_channels, col_chunks) =
+                    (column_writer_handles, col_array_channels, row_group_writer) =
                         spawn_column_parallel_row_group_writer(
                             schema.clone(),
                             writer_props.clone(),
@@ -1089,8 +1073,7 @@ fn spawn_parquet_parallel_serialization_task(
         drop(col_array_channels);
         let finalize_rg_task = spawn_rg_join_and_finalize_task(
             column_writer_handles,
-            col_chunks,
-            schema.clone(),
+            row_group_writer,
             current_rg_rows,
         );
 
