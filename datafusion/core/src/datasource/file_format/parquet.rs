@@ -17,8 +17,8 @@
 
 //! Parquet format abstractions
 
-use arrow_array::{ArrayRef, RecordBatch};
-use arrow_schema::Field;
+use arrow_array::RecordBatch;
+
 use parquet::arrow::arrow_writer::{ArrowColumnWriter, get_column_writers, ArrowLeafColumn, compute_leaves};
 use parquet::column::writer::ColumnCloseResult;
 use parquet::file::writer::SerializedFileWriter;
@@ -887,7 +887,7 @@ fn spawn_column_parallel_row_group_writer(
 ) -> Result<(Vec<ColumnJoinHandle>, Vec<ColSender>)> {
 
     let schema_desc = arrow_to_parquet_schema(&schema)?;
-    let mut col_writers =
+    let col_writers =
         get_column_writers(&schema_desc, &parquet_props, &schema)?;
     let num_columns = col_writers.len();
 
