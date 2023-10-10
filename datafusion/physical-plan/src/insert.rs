@@ -29,7 +29,7 @@ use arrow_schema::{DataType, Field, Schema};
 use async_trait::async_trait;
 use core::fmt;
 use datafusion_common::Result;
-use datafusion_physical_expr::{PhysicalSortRequirement, Distribution};
+use datafusion_physical_expr::{Distribution, PhysicalSortRequirement};
 use futures::StreamExt;
 use std::any::Any;
 use std::fmt::Debug;
@@ -201,7 +201,7 @@ impl ExecutionPlan for FileSinkExec {
         // own input at execution time
         vec![false]
     }
-    
+
     fn required_input_distribution(&self) -> Vec<Distribution> {
         vec![Distribution::SinglePartition; self.children().len()]
     }
