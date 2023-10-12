@@ -312,10 +312,12 @@ fn compute_partition_keys_by_row<'a>(
                     partition_values.push(array.value(i));
                 }
             }
-            _ => return Err(DataFusionError::NotImplemented(format!(
+            _ => {
+                return Err(DataFusionError::NotImplemented(format!(
                 "it is not yet supported to write to hive partitions with datatype {}",
                 dtype
-            ))),
+            )))
+            }
         }
 
         all_partition_values.push(partition_values);
