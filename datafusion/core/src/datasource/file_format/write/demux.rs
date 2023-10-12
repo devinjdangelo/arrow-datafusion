@@ -19,15 +19,11 @@
 //! dividing input stream into multiple output files at execution time
 
 use std::collections::HashMap;
-use std::io::Error;
-use std::mem;
-use std::pin::Pin;
-use std::sync::Arc;
-use std::task::{Context, Poll};
 
-use crate::datasource::file_format::file_compression_type::FileCompressionType;
-use crate::datasource::listing::{ListingTableUrl, PartitionedFile};
-use crate::datasource::physical_plan::{FileMeta, FileSinkConfig};
+use std::sync::Arc;
+
+use crate::datasource::listing::ListingTableUrl;
+
 use crate::error::Result;
 use crate::physical_plan::SendableRecordBatchStream;
 
@@ -36,21 +32,17 @@ use arrow_array::cast::AsArray;
 use arrow_array::{RecordBatch, StructArray};
 use arrow_schema::{DataType, Schema};
 use datafusion_common::cast::as_string_array;
-use datafusion_common::{exec_err, DataFusionError};
+use datafusion_common::DataFusionError;
 
-use async_trait::async_trait;
-use bytes::Bytes;
 use datafusion_execution::TaskContext;
-use futures::future::BoxFuture;
-use futures::FutureExt;
-use futures::{ready, StreamExt};
+
+use futures::StreamExt;
 use object_store::path::Path;
-use object_store::{MultipartId, ObjectMeta, ObjectStore};
+
 use rand::distributions::DistString;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::task::{JoinHandle, JoinSet};
-use tokio::try_join;
+use tokio::task::JoinHandle;
 
 type RecordBatchReceiver = Receiver<RecordBatch>;
 type DemuxedStreamReceiver = Receiver<(Path, RecordBatchReceiver)>;
@@ -172,133 +164,7 @@ async fn row_count_demuxer(
     Ok(())
 }
 
-/// Splits an input stream based on the distinct values of a set of columns
-/// Assumes standard hive style partition paths such as
-/// /col1=val1/col2=val2/outputfile.parquet
-async fn hive_style_partitions_demuxer(
-    tx: Sender<(Path, Receiver<RecordBatch>)>,
-    mut input: SendableRecordBatchStream,
-    context: Arc<TaskContext>,
-    partition_by: Vec<(String, DataType)>,
-    base_output_path: ListingTableUrl,
-    file_extension: String,
-) -> Result<()> {
-    let write_id =
-        rand::distributions::Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
-
-    let exec_options = &context.session_config().options().execution;
-    let max_buffered_recordbatches = exec_options.max_buffered_batches_per_output_file;
-
-    // To support non string partition col types, cast the type to &str first
-    let mut value_map: HashMap<Vec<String>, Sender<RecordBatch>> = HashMap::new();
-
-    while let Some(rb) = input.next().await.transpose()? {
-        let mut all_partition_values = vec![];
-
-        // First compute partition key for each row of batch, e.g. (col1=val1, col2=val2, ...)
-        for (col, dtype) in partition_by.iter() {
-            let mut partition_values = vec![];
-            let col_array =
-                rb.column_by_name(col)
-                    .ok_or(DataFusionError::Execution(format!(
-                        "PartitionBy Column {} does not exist in source data!",
-                        col
-                    )))?;
-
-            match dtype{
-                DataType::Utf8 => {
-                    let array = as_string_array(col_array)?;
-                    for i in 0..rb.num_rows(){
-                        partition_values.push(array.value(i));
-                    }
-                },
-                _ => return Err(DataFusionError::NotImplemented(format!("it is not yet supported to write to hive partitions with datatype {}", dtype)))
-            }
-
-            all_partition_values.push(partition_values);
-        }
-
-        // Next compute how the batch should be split up to take each distinct key to its own batch
-        let mut take_map = HashMap::new();
-        for i in 0..rb.num_rows() {
-            let mut part_key = vec![];
-            for vals in all_partition_values.iter() {
-                part_key.push(vals[i].to_owned());
-            }
-            let builder = take_map.entry(part_key).or_insert(UInt64Builder::new());
-            builder.append_value(i as u64);
-        }
-
-        // Divide up the batch into distinct partition key batches and send each batch
-        for (part_key, mut builder) in take_map.into_iter() {
-            // Take method adapted from https://github.com/lancedb/lance/pull/1337/files
-            // TODO: upstream RecordBatch::take to arrow-rs
-            let take_indices = builder.finish();
-            let struct_array: StructArray = rb.clone().into();
-            let parted_batch = RecordBatch::try_from(
-                arrow::compute::take(&struct_array, &take_indices, None)?.as_struct(),
-            )
-            .map_err(|_| {
-                DataFusionError::Internal("Unexpected error partitioning batch!".into())
-            })?;
-
-            let part_tx = match value_map.get_mut(&part_key) {
-                Some(part_tx) => part_tx,
-                None => {
-                    // Create channel for previously unseen distinct partition key and notify consumer of new file
-                    let (part_tx, part_rx) = tokio::sync::mpsc::channel::<RecordBatch>(
-                        max_buffered_recordbatches,
-                    );
-                    let mut file_path = base_output_path.prefix().clone();
-                    for j in 0..part_key.len() {
-                        file_path = file_path
-                            .child(format!("{}={}", partition_by[j].0, part_key[j]));
-                    }
-                    file_path =
-                        file_path.child(format!("{}.{}", write_id, file_extension));
-
-                    tx.send((file_path, part_rx)).await.map_err(|_| {
-                        DataFusionError::Execution(
-                            "Error sending new file stream!".into(),
-                        )
-                    })?;
-
-                    value_map.insert(part_key.clone(), part_tx);
-                    value_map
-                        .get_mut(&part_key)
-                        .ok_or(DataFusionError::Internal(
-                            "Key must exist since it was just inserted!".into(),
-                        ))?
-                }
-            };
-
-            // remove partitions columns
-            let end_idx = parted_batch.num_columns() - partition_by.len();
-            let non_part_cols = &parted_batch.columns()[..end_idx];
-            let mut non_part_fields = vec![];
-            'outer: for field in parted_batch.schema().all_fields() {
-                let name = field.name();
-                for (part_name, _) in partition_by.iter() {
-                    if name == part_name {
-                        continue 'outer;
-                    }
-                }
-                non_part_fields.push(field.to_owned())
-            }
-            let schema = Schema::new(non_part_fields);
-            let final_batch_to_send =
-                RecordBatch::try_new(Arc::new(schema), non_part_cols.into())?;
-
-            // Finally send the partial batch partitioned by distinct value!
-            part_tx.send(final_batch_to_send).await.map_err(|_| {
-                DataFusionError::Internal("Unexpected error sending parted batch!".into())
-            })?;
-        }
-    }
-
-    Ok(())
-}
-
+/// Helper for row count demuxer
 fn generate_file_path(
     base_output_path: &ListingTableUrl,
     write_id: &str,
@@ -315,6 +181,7 @@ fn generate_file_path(
     }
 }
 
+/// Helper for row count demuxer
 async fn create_new_file_stream(
     base_output_path: &ListingTableUrl,
     write_id: &str,
@@ -336,4 +203,177 @@ async fn create_new_file_stream(
         DataFusionError::Execution("Error sending RecordBatch to file stream!".into())
     })?;
     Ok(tx_file)
+}
+
+/// Splits an input stream based on the distinct values of a set of columns
+/// Assumes standard hive style partition paths such as
+/// /col1=val1/col2=val2/outputfile.parquet
+async fn hive_style_partitions_demuxer(
+    tx: Sender<(Path, Receiver<RecordBatch>)>,
+    mut input: SendableRecordBatchStream,
+    context: Arc<TaskContext>,
+    partition_by: Vec<(String, DataType)>,
+    base_output_path: ListingTableUrl,
+    file_extension: String,
+) -> Result<()> {
+    let write_id =
+        rand::distributions::Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
+
+    let exec_options = &context.session_config().options().execution;
+    let max_buffered_recordbatches = exec_options.max_buffered_batches_per_output_file;
+
+    // To support non string partition col types, cast the type to &str first
+    let mut value_map: HashMap<Vec<String>, Sender<RecordBatch>> = HashMap::new();
+
+    while let Some(rb) = input.next().await.transpose()? {
+        // First compute partition key for each row of batch, e.g. (col1=val1, col2=val2, ...)
+        let all_partition_values = compute_partition_keys_by_row(&rb, &partition_by)?;
+
+        // Next compute how the batch should be split up to take each distinct key to its own batch
+        let take_map = compute_take_arrays(&rb, all_partition_values);
+
+        // Divide up the batch into distinct partition key batches and send each batch
+        for (part_key, mut builder) in take_map.into_iter() {
+            // Take method adapted from https://github.com/lancedb/lance/pull/1337/files
+            // TODO: upstream RecordBatch::take to arrow-rs
+            let take_indices = builder.finish();
+            let struct_array: StructArray = rb.clone().into();
+            let parted_batch = RecordBatch::try_from(
+                arrow::compute::take(&struct_array, &take_indices, None)?.as_struct(),
+            )
+            .map_err(|_| {
+                DataFusionError::Internal("Unexpected error partitioning batch!".into())
+            })?;
+
+            // Get or create channel for this batch
+            let part_tx = match value_map.get_mut(&part_key) {
+                Some(part_tx) => part_tx,
+                None => {
+                    // Create channel for previously unseen distinct partition key and notify consumer of new file
+                    let (part_tx, part_rx) = tokio::sync::mpsc::channel::<RecordBatch>(
+                        max_buffered_recordbatches,
+                    );
+                    let file_path = compute_hive_style_file_path(
+                        &part_key,
+                        &partition_by,
+                        &write_id,
+                        &file_extension,
+                        &base_output_path,
+                    );
+
+                    tx.send((file_path, part_rx)).await.map_err(|_| {
+                        DataFusionError::Execution(
+                            "Error sending new file stream!".into(),
+                        )
+                    })?;
+
+                    value_map.insert(part_key.clone(), part_tx);
+                    value_map
+                        .get_mut(&part_key)
+                        .ok_or(DataFusionError::Internal(
+                            "Key must exist since it was just inserted!".into(),
+                        ))?
+                }
+            };
+
+            // remove partitions columns
+            let final_batch_to_send =
+                remove_partition_by_columns(&parted_batch, &partition_by)?;
+
+            // Finally send the partial batch partitioned by distinct value!
+            part_tx.send(final_batch_to_send).await.map_err(|_| {
+                DataFusionError::Internal("Unexpected error sending parted batch!".into())
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
+fn compute_partition_keys_by_row<'a>(
+    rb: &'a RecordBatch,
+    partition_by: &'a Vec<(String, DataType)>,
+) -> Result<Vec<Vec<&'a str>>> {
+    let mut all_partition_values = vec![];
+
+    for (col, dtype) in partition_by.iter() {
+        let mut partition_values = vec![];
+        let col_array =
+            rb.column_by_name(col)
+                .ok_or(DataFusionError::Execution(format!(
+                    "PartitionBy Column {} does not exist in source data!",
+                    col
+                )))?;
+
+        match dtype {
+            DataType::Utf8 => {
+                let array = as_string_array(col_array)?;
+                for i in 0..rb.num_rows() {
+                    partition_values.push(array.value(i));
+                }
+            }
+            _ => return Err(DataFusionError::NotImplemented(format!(
+                "it is not yet supported to write to hive partitions with datatype {}",
+                dtype
+            ))),
+        }
+
+        all_partition_values.push(partition_values);
+    }
+
+    Ok(all_partition_values)
+}
+
+fn compute_take_arrays(
+    rb: &RecordBatch,
+    all_partition_values: Vec<Vec<&str>>,
+) -> HashMap<Vec<String>, UInt64Builder> {
+    let mut take_map = HashMap::new();
+    for i in 0..rb.num_rows() {
+        let mut part_key = vec![];
+        for vals in all_partition_values.iter() {
+            part_key.push(vals[i].to_owned());
+        }
+        let builder = take_map.entry(part_key).or_insert(UInt64Builder::new());
+        builder.append_value(i as u64);
+    }
+    take_map
+}
+
+fn remove_partition_by_columns(
+    parted_batch: &RecordBatch,
+    partition_by: &Vec<(String, DataType)>,
+) -> Result<RecordBatch> {
+    let end_idx = parted_batch.num_columns() - partition_by.len();
+    let non_part_cols = &parted_batch.columns()[..end_idx];
+    let mut non_part_fields = vec![];
+    'outer: for field in parted_batch.schema().all_fields() {
+        let name = field.name();
+        for (part_name, _) in partition_by.iter() {
+            if name == part_name {
+                continue 'outer;
+            }
+        }
+        non_part_fields.push(field.to_owned())
+    }
+    let schema = Schema::new(non_part_fields);
+    let final_batch_to_send =
+        RecordBatch::try_new(Arc::new(schema), non_part_cols.into())?;
+
+    Ok(final_batch_to_send)
+}
+
+fn compute_hive_style_file_path(
+    part_key: &Vec<String>,
+    partition_by: &Vec<(String, DataType)>,
+    write_id: &str,
+    file_extension: &str,
+    base_output_path: &ListingTableUrl,
+) -> Path {
+    let mut file_path = base_output_path.prefix().clone();
+    for j in 0..part_key.len() {
+        file_path = file_path.child(format!("{}={}", partition_by[j].0, part_key[j]));
+    }
+
+    file_path.child(format!("{}.{}", write_id, file_extension))
 }

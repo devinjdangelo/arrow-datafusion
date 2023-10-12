@@ -18,7 +18,6 @@
 //! Module containing helper methods/traits related to enabling
 //! write support for the various file formats
 
-use std::collections::HashMap;
 use std::io::Error;
 use std::mem;
 use std::pin::Pin;
@@ -26,33 +25,24 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use crate::datasource::file_format::file_compression_type::FileCompressionType;
-use crate::datasource::listing::{ListingTableUrl, PartitionedFile};
-use crate::datasource::physical_plan::{FileMeta, FileSinkConfig};
-use crate::error::Result;
-use crate::physical_plan::SendableRecordBatchStream;
 
-use arrow_array::builder::UInt64Builder;
-use arrow_array::cast::AsArray;
-use arrow_array::{RecordBatch, StructArray};
-use arrow_schema::{DataType, Schema};
-use datafusion_common::cast::as_string_array;
+use crate::datasource::physical_plan::FileMeta;
+use crate::error::Result;
+
+use arrow_array::RecordBatch;
+
 use datafusion_common::{exec_err, DataFusionError};
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use datafusion_execution::TaskContext;
+
 use futures::future::BoxFuture;
+use futures::ready;
 use futures::FutureExt;
-use futures::{ready, StreamExt};
 use object_store::path::Path;
 use object_store::{MultipartId, ObjectMeta, ObjectStore};
-use rand::distributions::DistString;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc::{self, Receiver, Sender};
-use tokio::task::{JoinHandle, JoinSet};
-use tokio::try_join;
 
-use self::demux::start_demuxer_task;
+use tokio::io::AsyncWrite;
 
 pub(crate) mod demux;
 pub(crate) mod orchestration;
@@ -313,4 +303,3 @@ pub(crate) async fn create_writer(
         }
     }
 }
-

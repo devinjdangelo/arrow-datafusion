@@ -15,45 +15,36 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Module containing helper methods/traits related to enabling
-//! write support for the various file formats
+//! Module containing helper methods/traits related to
+//! orchestrating file serialization, streaming to object store,
+//! parallelization, and abort handling
 
-use std::collections::HashMap;
-use std::io::Error;
-use std::mem;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
 use crate::datasource::file_format::file_compression_type::FileCompressionType;
-use crate::datasource::listing::{ListingTableUrl, PartitionedFile};
-use crate::datasource::physical_plan::{FileMeta, FileSinkConfig};
+use crate::datasource::listing::PartitionedFile;
+use crate::datasource::physical_plan::FileSinkConfig;
 use crate::error::Result;
 use crate::physical_plan::SendableRecordBatchStream;
 
-use arrow_array::builder::UInt64Builder;
-use arrow_array::cast::AsArray;
-use arrow_array::{RecordBatch, StructArray};
-use arrow_schema::{DataType, Schema};
-use datafusion_common::cast::as_string_array;
-use datafusion_common::{exec_err, DataFusionError};
+use arrow_array::RecordBatch;
 
-use async_trait::async_trait;
+use datafusion_common::DataFusionError;
+
 use bytes::Bytes;
 use datafusion_execution::TaskContext;
-use futures::future::BoxFuture;
-use futures::FutureExt;
-use futures::{ready, StreamExt};
-use object_store::path::Path;
-use object_store::{MultipartId, ObjectMeta, ObjectStore};
-use rand::distributions::DistString;
+
+use futures::StreamExt;
+
+use object_store::{ObjectMeta, ObjectStore};
+
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::try_join;
 
 use super::demux::start_demuxer_task;
-use super::{BatchSerializer, AbortableWrite, create_writer, FileWriterMode};
+use super::{create_writer, AbortableWrite, BatchSerializer, FileWriterMode};
 
 type WriterType = AbortableWrite<Box<dyn AsyncWrite + Send + Unpin>>;
 type SerializerType = Box<dyn BatchSerializer>;
@@ -144,8 +135,6 @@ pub(crate) async fn serialize_rb_stream_to_object_store(
     };
     Ok((writer, row_count as u64))
 }
-
-
 
 type FileWriteBundle = (Receiver<RecordBatch>, SerializerType, WriterType);
 /// Contains the common logic for serializing RecordBatches and
