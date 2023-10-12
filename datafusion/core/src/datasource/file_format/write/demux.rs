@@ -292,7 +292,7 @@ async fn hive_style_partitions_demuxer(
 
 fn compute_partition_keys_by_row<'a>(
     rb: &'a RecordBatch,
-    partition_by: &'a Vec<(String, DataType)>,
+    partition_by: &'a [(String, DataType)],
 ) -> Result<Vec<Vec<&'a str>>> {
     let mut all_partition_values = vec![];
 
@@ -365,7 +365,7 @@ fn remove_partition_by_columns(
 
 fn compute_hive_style_file_path(
     part_key: &Vec<String>,
-    partition_by: &Vec<(String, DataType)>,
+    partition_by: &[(String, DataType)],
     write_id: &str,
     file_extension: &str,
     base_output_path: &ListingTableUrl,
