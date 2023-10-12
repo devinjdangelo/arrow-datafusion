@@ -485,7 +485,7 @@ impl CsvSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> Result<u64> {
-        if self.config.table_partition_cols.is_empty() {
+        if !self.config.table_partition_cols.is_empty() {
             return Err(DataFusionError::NotImplemented("Inserting in append mode to hive style partitioned tables is not supported".into()));
         }
         let writer_options = self.config.file_type_writer_options.try_into_csv()?;

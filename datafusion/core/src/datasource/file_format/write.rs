@@ -34,7 +34,7 @@ use crate::physical_plan::SendableRecordBatchStream;
 use arrow_array::builder::UInt64Builder;
 use arrow_array::cast::AsArray;
 use arrow_array::{RecordBatch, StructArray};
-use arrow_schema::DataType;
+use arrow_schema::{DataType, Schema};
 use datafusion_common::cast::as_string_array;
 use datafusion_common::{exec_err, DataFusionError};
 
@@ -404,7 +404,7 @@ type DemuxedStreamReceiver = Receiver<(Path, RecordBatchReceiver)>;
 
 /// Dynamically partitions input stream to acheive desired maximum rows per file
 async fn row_count_demuxer(
-    tx: Sender<(Path, Receiver<RecordBatch>)>,
+    mut tx: Sender<(Path, Receiver<RecordBatch>)>,
     mut input: SendableRecordBatchStream,
     context: Arc<TaskContext>,
     base_output_path: ListingTableUrl,
@@ -413,44 +413,42 @@ async fn row_count_demuxer(
 ) -> Result<()> {
     let exec_options = &context.session_config().options().execution;
     let max_rows_per_file = exec_options.soft_max_rows_per_output_file;
-    let max_buffered_recordbatches = exec_options.max_buffered_batches_per_output_file;
-
+    let max_buffered_batches = exec_options.max_buffered_batches_per_output_file;
     let mut total_rows_current_file = 0;
     let mut part_idx = 0;
     let write_id =
         rand::distributions::Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
-    let file_path = if !single_file_output {
-        base_output_path
-            .prefix()
-            .child(format!("{}_{}.{}", write_id, part_idx, file_extension))
-    } else {
-        base_output_path.prefix().to_owned()
-    };
 
-    let (mut tx_file, mut rx_file) =
-        tokio::sync::mpsc::channel(max_buffered_recordbatches / 2);
-    tx.send((file_path, rx_file)).await.map_err(|_| {
-        DataFusionError::Execution("Error sending new file stream!".into())
-    })?;
+    let mut tx_file = create_new_file_stream(
+        &base_output_path,
+        &write_id,
+        part_idx,
+        &file_extension,
+        single_file_output,
+        max_buffered_batches,
+        &mut tx,
+    )
+    .await?;
     part_idx += 1;
+
     while let Some(rb) = input.next().await.transpose()? {
         total_rows_current_file += rb.num_rows();
         tx_file.send(rb).await.map_err(|_| {
             DataFusionError::Execution("Error sending RecordBatch to file stream!".into())
         })?;
 
-        // Once we have sent enough data to previous file stream, spawn a new one
         if total_rows_current_file >= max_rows_per_file && !single_file_output {
             total_rows_current_file = 0;
-
-            let file_path = base_output_path
-                .prefix()
-                .child(format!("{}_{}.{}", write_id, part_idx, file_extension));
-            (tx_file, rx_file) = tokio::sync::mpsc::channel(max_buffered_recordbatches);
-            tx.send((file_path, rx_file)).await.map_err(|_| {
-                DataFusionError::Execution("Error sending new file stream!".into())
-            })?;
-
+            tx_file = create_new_file_stream(
+                &base_output_path,
+                &write_id,
+                part_idx,
+                &file_extension,
+                single_file_output,
+                max_buffered_batches,
+                &mut tx,
+            )
+            .await?;
             part_idx += 1;
         }
     }
@@ -551,12 +549,31 @@ async fn hive_style_partitions_demuxer(
                     value_map.insert(part_key.clone(), part_tx);
                     value_map
                         .get_mut(&part_key)
-                        .ok_or(DataFusionError::Internal("Key must exist since it was just inserted!".into()))?
+                        .ok_or(DataFusionError::Internal(
+                            "Key must exist since it was just inserted!".into(),
+                        ))?
                 }
             };
 
+            // remove partitions columns
+            let end_idx = parted_batch.num_columns() - partition_by.len();
+            let non_part_cols = &parted_batch.columns()[..end_idx];
+            let mut non_part_fields = vec![];
+            'outer: for field in parted_batch.schema().all_fields() {
+                let name = field.name();
+                for (part_name, _) in partition_by.iter() {
+                    if name == part_name {
+                        continue 'outer;
+                    }
+                }
+                non_part_fields.push(field.to_owned())
+            }
+            let schema = Schema::new(non_part_fields);
+            let final_batch_to_send =
+                RecordBatch::try_new(Arc::new(schema), non_part_cols.into())?;
+
             // Finally send the partial batch partitioned by distinct value!
-            part_tx.send(parted_batch).await.map_err(|_| {
+            part_tx.send(final_batch_to_send).await.map_err(|_| {
                 DataFusionError::Internal("Unexpected error sending parted batch!".into())
             })?;
         }
@@ -667,7 +684,6 @@ async fn create_new_file_stream(
     })?;
     Ok(tx_file)
 }
-
 
 type FileWriteBundle = (Receiver<RecordBatch>, SerializerType, WriterType);
 /// Contains the common logic for serializing RecordBatches and
@@ -780,7 +796,7 @@ pub(crate) async fn stateless_multipart_put(
     let single_file_output = config.single_file_output;
     let base_output_path = &config.table_paths[0];
     let unbounded_input = config.unbounded_input;
-    let part_cols = if config.table_partition_cols.is_empty() {
+    let part_cols = if !config.table_partition_cols.is_empty() {
         Some(config.table_partition_cols.clone())
     } else {
         None
@@ -836,12 +852,6 @@ pub(crate) async fn stateless_multipart_put(
     // Signal to the write coordinater that no more files are coming
     drop(tx_file_bundle);
 
-    let total_count = rx_row_cnt.await.map_err(|_| {
-        DataFusionError::Internal(
-            "Did not receieve row count from write coordinater".into(),
-        )
-    })?;
-
     match try_join!(write_coordinater_task, demux_task) {
         Ok((r1, r2)) => {
             r1?;
@@ -855,6 +865,12 @@ pub(crate) async fn stateless_multipart_put(
             }
         }
     }
+
+    let total_count = rx_row_cnt.await.map_err(|_| {
+        DataFusionError::Internal(
+            "Did not receieve row count from write coordinater".into(),
+        )
+    })?;
 
     Ok(total_count)
 }
