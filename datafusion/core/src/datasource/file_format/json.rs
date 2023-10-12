@@ -49,8 +49,7 @@ use crate::physical_plan::insert::FileSinkExec;
 use crate::physical_plan::SendableRecordBatchStream;
 use crate::physical_plan::{DisplayAs, DisplayFormatType, Statistics};
 
-use super::write::stateless_append_all;
-use super::write::stateless_multipart_put;
+use super::write::orchestration::{stateless_append_all,stateless_multipart_put};
 use super::FileFormat;
 use super::FileScanConfig;
 use crate::datasource::file_format::file_compression_type::FileCompressionType;

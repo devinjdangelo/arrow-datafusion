@@ -46,7 +46,8 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::file::properties::WriterProperties;
 use parquet::file::statistics::Statistics as ParquetStatistics;
 
-use super::write::{create_writer, start_demuxer_task, AbortableWrite, FileWriterMode};
+use super::write::demux::start_demuxer_task;
+use super::write::{create_writer, AbortableWrite, FileWriterMode};
 use super::FileFormat;
 use super::FileScanConfig;
 use crate::arrow::array::{
