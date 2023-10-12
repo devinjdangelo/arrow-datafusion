@@ -1615,10 +1615,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_into_append_new_json_files() -> Result<()> {
+        let mut config_map: HashMap<String, String> = HashMap::new();
+        config_map.insert("datafusion.execution.batch_size".into(), "1".into());
+        config_map.insert(
+            "datafusion.execution.soft_max_rows_per_output_file".into(),
+            "1".into(),
+        );
         helper_test_append_new_files_to_table(
             FileType::JSON,
             FileCompressionType::UNCOMPRESSED,
-            None,
+            Some(config_map),
         )
         .await?;
         Ok(())
@@ -1637,10 +1643,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_into_append_new_csv_files() -> Result<()> {
+        let mut config_map: HashMap<String, String> = HashMap::new();
+        config_map.insert("datafusion.execution.batch_size".into(), "1".into());
+        config_map.insert(
+            "datafusion.execution.soft_max_rows_per_output_file".into(),
+            "1".into(),
+        );
         helper_test_append_new_files_to_table(
             FileType::CSV,
             FileCompressionType::UNCOMPRESSED,
-            None,
+            Some(config_map),
         )
         .await?;
         Ok(())
@@ -1648,10 +1660,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_insert_into_append_new_parquet_files_defaults() -> Result<()> {
+        let mut config_map: HashMap<String, String> = HashMap::new();
+        config_map.insert("datafusion.execution.batch_size".into(), "1".into());
+        config_map.insert(
+            "datafusion.execution.soft_max_rows_per_output_file".into(),
+            "1".into(),
+        );
         helper_test_append_new_files_to_table(
             FileType::PARQUET,
             FileCompressionType::UNCOMPRESSED,
-            None,
+            Some(config_map),
         )
         .await?;
         Ok(())
@@ -1778,6 +1796,11 @@ mod tests {
     #[tokio::test]
     async fn test_insert_into_append_new_parquet_files_session_overrides() -> Result<()> {
         let mut config_map: HashMap<String, String> = HashMap::new();
+        config_map.insert("datafusion.execution.batch_size".into(), "1".into());
+        config_map.insert(
+            "datafusion.execution.soft_max_rows_per_output_file".into(),
+            "1".into(),
+        );
         config_map.insert(
             "datafusion.execution.parquet.compression".into(),
             "zstd(5)".into(),
@@ -2224,7 +2247,7 @@ mod tests {
 
         // Assert that `target_partition_number` many files were added to the table.
         let num_files = tmp_dir.path().read_dir()?.count();
-        assert_eq!(num_files, 1);
+        assert_eq!(num_files, 3);
 
         // Create a physical plan from the insert plan
         let plan = session_ctx
@@ -2267,7 +2290,7 @@ mod tests {
 
         // Assert that another `target_partition_number` many files were added to the table.
         let num_files = tmp_dir.path().read_dir()?.count();
-        assert_eq!(num_files, 2);
+        assert_eq!(num_files, 6);
 
         // Return Ok if the function
         Ok(())
