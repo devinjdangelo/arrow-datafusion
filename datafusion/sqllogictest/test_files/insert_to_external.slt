@@ -87,6 +87,58 @@ SELECT * from ordered_insert_test;
 7 8
 7 7
 
+# test partitioned insert
+
+statement ok
+CREATE EXTERNAL TABLE
+partitioned_insert_test(a string, b string, c bigint)
+STORED AS csv
+LOCATION 'test_files/scratch/insert_to_external/insert_to_partitioned/'
+PARTITIONED BY (a, b) 
+OPTIONS(
+create_local_path 'true',
+insert_mode 'append_new_files',
+);
+
+#note that partitioned cols are moved to the end so value tuples are (c, a, b)
+
+query ITT
+INSERT INTO partitioned_insert_test values (1, 1, 1), (1, 1, 2), (1, 2, 1), (1, 2, 2), (2, 2, 1), (2, 2, 2);
+----
+6
+
+statement ok
+CREATE EXTERNAL TABLE
+partitioned_insert_test_json(a string, b bigint)
+STORED AS json
+LOCATION 'test_files/scratch/insert_to_external/insert_to_partitioned_json/'
+PARTITIONED BY (a) 
+OPTIONS(
+create_local_path 'true',
+insert_mode 'append_new_files',
+);
+
+query IT
+INSERT INTO partitioned_insert_test_json values (1, 2), (3, 4), (5, 6), (1, 2), (3, 4), (5, 6);
+----
+6
+
+statement ok
+CREATE EXTERNAL TABLE
+partitioned_insert_test_pq(a string, b bigint)
+STORED AS parquet
+LOCATION 'test_files/scratch/insert_to_external/insert_to_partitioned_pq/'
+PARTITIONED BY (a) 
+OPTIONS(
+create_local_path 'true',
+insert_mode 'append_new_files',
+);
+
+query IT
+INSERT INTO partitioned_insert_test_pq values (1, 2), (3, 4), (5, 6), (1, 2), (3, 4), (5, 6);
+----
+6
+
 statement ok
 CREATE EXTERNAL TABLE
 single_file_test(a bigint, b bigint)

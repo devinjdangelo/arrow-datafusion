@@ -730,10 +730,16 @@ impl DataSink for ParquetSink {
             .map(|r| r as u64);
         }
 
+        let part_col = if self.config.table_partition_cols.is_empty() {
+            Some(self.config.table_partition_cols.clone())
+        } else {
+            None
+        };
+
         let (demux_task, mut file_stream_rx) = start_demuxer_task(
             data,
             context,
-            None,
+            part_col,
             self.config.table_paths[0].clone(),
             "parquet".into(),
             self.config.single_file_output,

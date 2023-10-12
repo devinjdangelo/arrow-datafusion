@@ -18,6 +18,7 @@
 //! Module containing helper methods/traits related to enabling
 //! write support for the various file formats
 
+use std::collections::HashMap;
 use std::io::Error;
 use std::mem;
 use std::pin::Pin;
@@ -30,7 +31,11 @@ use crate::datasource::physical_plan::{FileMeta, FileSinkConfig};
 use crate::error::Result;
 use crate::physical_plan::SendableRecordBatchStream;
 
-use arrow_array::RecordBatch;
+use arrow_array::builder::UInt64Builder;
+use arrow_array::cast::AsArray;
+use arrow_array::{RecordBatch, StructArray};
+use arrow_schema::DataType;
+use datafusion_common::cast::as_string_array;
 use datafusion_common::{exec_err, DataFusionError};
 
 use async_trait::async_trait;
@@ -397,6 +402,169 @@ pub(crate) async fn serialize_rb_stream_to_object_store(
 type RecordBatchReceiver = Receiver<RecordBatch>;
 type DemuxedStreamReceiver = Receiver<(Path, RecordBatchReceiver)>;
 
+/// Dynamically partitions input stream to acheive desired maximum rows per file
+async fn row_count_demuxer(
+    tx: Sender<(Path, Receiver<RecordBatch>)>,
+    mut input: SendableRecordBatchStream,
+    context: Arc<TaskContext>,
+    base_output_path: ListingTableUrl,
+    file_extension: String,
+    single_file_output: bool,
+) -> Result<()> {
+    let exec_options = &context.session_config().options().execution;
+    let max_rows_per_file = exec_options.soft_max_rows_per_output_file;
+    let max_buffered_recordbatches = exec_options.max_buffered_batches_per_output_file;
+
+    let mut total_rows_current_file = 0;
+    let mut part_idx = 0;
+    let write_id =
+        rand::distributions::Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
+    let file_path = if !single_file_output {
+        base_output_path
+            .prefix()
+            .child(format!("{}_{}.{}", write_id, part_idx, file_extension))
+    } else {
+        base_output_path.prefix().to_owned()
+    };
+
+    let (mut tx_file, mut rx_file) =
+        tokio::sync::mpsc::channel(max_buffered_recordbatches / 2);
+    tx.send((file_path, rx_file)).await.map_err(|_| {
+        DataFusionError::Execution("Error sending new file stream!".into())
+    })?;
+    part_idx += 1;
+    while let Some(rb) = input.next().await.transpose()? {
+        total_rows_current_file += rb.num_rows();
+        tx_file.send(rb).await.map_err(|_| {
+            DataFusionError::Execution("Error sending RecordBatch to file stream!".into())
+        })?;
+
+        // Once we have sent enough data to previous file stream, spawn a new one
+        if total_rows_current_file >= max_rows_per_file && !single_file_output {
+            total_rows_current_file = 0;
+
+            let file_path = base_output_path
+                .prefix()
+                .child(format!("{}_{}.{}", write_id, part_idx, file_extension));
+            (tx_file, rx_file) = tokio::sync::mpsc::channel(max_buffered_recordbatches);
+            tx.send((file_path, rx_file)).await.map_err(|_| {
+                DataFusionError::Execution("Error sending new file stream!".into())
+            })?;
+
+            part_idx += 1;
+        }
+    }
+    Ok(())
+}
+
+/// Splits an input stream based on the distinct values of a set of columns
+/// Assumes standard hive style partition paths such as
+/// /col1=val1/col2=val2/outputfile.parquet
+async fn hive_style_partitions_demuxer(
+    tx: Sender<(Path, Receiver<RecordBatch>)>,
+    mut input: SendableRecordBatchStream,
+    context: Arc<TaskContext>,
+    partition_by: Vec<(String, DataType)>,
+    base_output_path: ListingTableUrl,
+    file_extension: String,
+) -> Result<()> {
+    let write_id =
+        rand::distributions::Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
+
+    let exec_options = &context.session_config().options().execution;
+    let max_buffered_recordbatches = exec_options.max_buffered_batches_per_output_file;
+
+    // To support non string partition col types, cast the type to &str first
+    let mut value_map: HashMap<Vec<String>, Sender<RecordBatch>> = HashMap::new();
+
+    while let Some(rb) = input.next().await.transpose()? {
+        let mut all_partition_values = vec![];
+
+        // First compute partition key for each row of batch, e.g. (col1=val1, col2=val2, ...)
+        for (col, dtype) in partition_by.iter() {
+            let mut partition_values = vec![];
+            let col_array =
+                rb.column_by_name(col)
+                    .ok_or(DataFusionError::Execution(format!(
+                        "PartitionBy Column {} does not exist in source data!",
+                        col
+                    )))?;
+
+            match dtype{
+                DataType::Utf8 => {
+                    let array = as_string_array(col_array)?;
+                    for i in 0..rb.num_rows(){
+                        partition_values.push(array.value(i));
+                    }
+                },
+                _ => return Err(DataFusionError::NotImplemented(format!("it is not yet supported to write to hive partitions with datatype {}", dtype)))
+            }
+
+            all_partition_values.push(partition_values);
+        }
+
+        // Next compute how the batch should be split up to take each distinct key to its own batch
+        let mut take_map = HashMap::new();
+        for i in 0..rb.num_rows() {
+            let mut part_key = vec![];
+            for vals in all_partition_values.iter() {
+                part_key.push(vals[i].to_owned());
+            }
+            let builder = take_map.entry(part_key).or_insert(UInt64Builder::new());
+            builder.append_value(i as u64);
+        }
+
+        // Divide up the batch into distinct partition key batches and send each batch
+        for (part_key, mut builder) in take_map.into_iter() {
+            // Take method adapted from https://github.com/lancedb/lance/pull/1337/files
+            // TODO: upstream RecordBatch::take to arrow-rs
+            let take_indices = builder.finish();
+            let struct_array: StructArray = rb.clone().into();
+            let parted_batch = RecordBatch::try_from(
+                arrow::compute::take(&struct_array, &take_indices, None)?.as_struct(),
+            )
+            .map_err(|_| {
+                DataFusionError::Internal("Unexpected error partitioning batch!".into())
+            })?;
+
+            let part_tx = match value_map.get_mut(&part_key) {
+                Some(part_tx) => part_tx,
+                None => {
+                    // Create channel for previously unseen distinct partition key and notify consumer of new file
+                    let (part_tx, part_rx) = tokio::sync::mpsc::channel::<RecordBatch>(
+                        max_buffered_recordbatches,
+                    );
+                    let mut file_path = base_output_path.prefix().clone();
+                    for j in 0..part_key.len() {
+                        file_path = file_path
+                            .child(format!("{}={}", partition_by[j].0, part_key[j]));
+                    }
+                    file_path =
+                        file_path.child(format!("{}.{}", write_id, file_extension));
+
+                    tx.send((file_path, part_rx)).await.map_err(|_| {
+                        DataFusionError::Execution(
+                            "Error sending new file stream!".into(),
+                        )
+                    })?;
+
+                    value_map.insert(part_key.clone(), part_tx);
+                    value_map
+                        .get_mut(&part_key)
+                        .ok_or(DataFusionError::Internal("Key must exist since it was just inserted!".into()))?
+                }
+            };
+
+            // Finally send the partial batch partitioned by distinct value!
+            part_tx.send(parted_batch).await.map_err(|_| {
+                DataFusionError::Internal("Unexpected error sending parted batch!".into())
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 /// Splits a single [SendableRecordBatchStream] into a dynamically determined
 /// number of partitions at execution time. The partitions are determined by
 /// factors known only at execution time, such as total number of rows and
@@ -423,31 +591,41 @@ type DemuxedStreamReceiver = Receiver<(Path, RecordBatchReceiver)>;
 pub(crate) fn start_demuxer_task(
     input: SendableRecordBatchStream,
     context: &Arc<TaskContext>,
-    _partition_by: Option<&str>,
+    partition_by: Option<Vec<(String, DataType)>>,
     base_output_path: ListingTableUrl,
     file_extension: String,
     single_file_output: bool,
 ) -> (JoinHandle<Result<()>>, DemuxedStreamReceiver) {
     let exec_options = &context.session_config().options().execution;
-
-    let max_rows_per_file = exec_options.soft_max_rows_per_output_file;
     let max_parallel_files = exec_options.max_parallel_ouput_files;
-    let max_buffered_batches = exec_options.max_buffered_batches_per_output_file;
 
-    let (tx, rx) = mpsc::channel(max_parallel_files);
+    let (tx, rx) = tokio::sync::mpsc::channel(max_parallel_files);
+    let context = context.clone();
+    let task: JoinHandle<std::result::Result<(), DataFusionError>> = match partition_by {
+        Some(parts) => tokio::spawn(async move {
+            hive_style_partitions_demuxer(
+                tx,
+                input,
+                context,
+                parts,
+                base_output_path,
+                file_extension,
+            )
+            .await
+        }),
+        None => tokio::spawn(async move {
+            row_count_demuxer(
+                tx,
+                input,
+                context,
+                base_output_path,
+                file_extension,
+                single_file_output,
+            )
+            .await
+        }),
+    };
 
-    let task = tokio::spawn(async move {
-        row_count_demuxer(
-            input,
-            base_output_path,
-            file_extension,
-            single_file_output,
-            max_rows_per_file,
-            max_buffered_batches,
-            tx,
-        )
-        .await
-    });
     (task, rx)
 }
 
@@ -490,55 +668,6 @@ async fn create_new_file_stream(
     Ok(tx_file)
 }
 
-async fn row_count_demuxer(
-    mut input: SendableRecordBatchStream,
-    base_output_path: ListingTableUrl,
-    file_extension: String,
-    single_file_output: bool,
-    max_rows_per_file: usize,
-    max_buffered_batches: usize,
-    mut tx: Sender<(Path, Receiver<RecordBatch>)>,
-) -> Result<()> {
-    let mut total_rows_current_file = 0;
-    let mut part_idx = 0;
-    let write_id =
-        rand::distributions::Alphanumeric.sample_string(&mut rand::thread_rng(), 16);
-
-    let mut tx_file = create_new_file_stream(
-        &base_output_path,
-        &write_id,
-        part_idx,
-        &file_extension,
-        single_file_output,
-        max_buffered_batches,
-        &mut tx,
-    )
-    .await?;
-    part_idx += 1;
-
-    while let Some(rb) = input.next().await.transpose()? {
-        total_rows_current_file += rb.num_rows();
-        tx_file.send(rb).await.map_err(|_| {
-            DataFusionError::Execution("Error sending RecordBatch to file stream!".into())
-        })?;
-
-        if total_rows_current_file >= max_rows_per_file && !single_file_output {
-            total_rows_current_file = 0;
-            tx_file = create_new_file_stream(
-                &base_output_path,
-                &write_id,
-                part_idx,
-                &file_extension,
-                single_file_output,
-                max_buffered_batches,
-                &mut tx,
-            )
-            .await?;
-            part_idx += 1;
-        }
-    }
-    Ok(())
-}
 
 type FileWriteBundle = (Receiver<RecordBatch>, SerializerType, WriterType);
 /// Contains the common logic for serializing RecordBatches and
@@ -651,11 +780,16 @@ pub(crate) async fn stateless_multipart_put(
     let single_file_output = config.single_file_output;
     let base_output_path = &config.table_paths[0];
     let unbounded_input = config.unbounded_input;
+    let part_cols = if config.table_partition_cols.is_empty() {
+        Some(config.table_partition_cols.clone())
+    } else {
+        None
+    };
 
     let (demux_task, mut file_stream_rx) = start_demuxer_task(
         data,
         context,
-        None,
+        part_cols,
         base_output_path.clone(),
         file_extension,
         single_file_output,
