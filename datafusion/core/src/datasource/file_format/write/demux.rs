@@ -41,11 +41,11 @@ use object_store::path::Path;
 
 use rand::distributions::DistString;
 
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::mpsc::{self, Receiver, Sender, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
 type RecordBatchReceiver = Receiver<RecordBatch>;
-type DemuxedStreamReceiver = Receiver<(Path, RecordBatchReceiver)>;
+type DemuxedStreamReceiver = UnboundedReceiver<(Path, RecordBatchReceiver)>;
 
 /// Splits a single [SendableRecordBatchStream] into a dynamically determined
 /// number of partitions at execution time. The partitions are determined by
@@ -78,23 +78,24 @@ pub(crate) fn start_demuxer_task(
     file_extension: String,
     single_file_output: bool,
 ) -> (JoinHandle<Result<()>>, DemuxedStreamReceiver) {
-    let exec_options = &context.session_config().options().execution;
-    let max_parallel_files = exec_options.max_parallel_ouput_files;
-
-    let (tx, rx) = tokio::sync::mpsc::channel(max_parallel_files);
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let context = context.clone();
     let task: JoinHandle<std::result::Result<(), DataFusionError>> = match partition_by {
-        Some(parts) => tokio::spawn(async move {
-            hive_style_partitions_demuxer(
-                tx,
-                input,
-                context,
-                parts,
-                base_output_path,
-                file_extension,
-            )
-            .await
-        }),
+        Some(parts) => {
+            // There could be an arbitrarily large number of parallel hive style partitions being written to, so we cannot
+            // bound this channel without risking a deadlock.
+            tokio::spawn(async move {
+                hive_style_partitions_demuxer(
+                    tx,
+                    input,
+                    context,
+                    parts,
+                    base_output_path,
+                    file_extension,
+                )
+                .await
+            })
+        }
         None => tokio::spawn(async move {
             row_count_demuxer(
                 tx,
@@ -113,7 +114,7 @@ pub(crate) fn start_demuxer_task(
 
 /// Dynamically partitions input stream to acheive desired maximum rows per file
 async fn row_count_demuxer(
-    mut tx: Sender<(Path, Receiver<RecordBatch>)>,
+    mut tx: UnboundedSender<(Path, Receiver<RecordBatch>)>,
     mut input: SendableRecordBatchStream,
     context: Arc<TaskContext>,
     base_output_path: ListingTableUrl,
@@ -136,8 +137,7 @@ async fn row_count_demuxer(
         single_file_output,
         max_buffered_batches,
         &mut tx,
-    )
-    .await?;
+    )?;
     part_idx += 1;
 
     while let Some(rb) = input.next().await.transpose()? {
@@ -156,8 +156,7 @@ async fn row_count_demuxer(
                 single_file_output,
                 max_buffered_batches,
                 &mut tx,
-            )
-            .await?;
+            )?;
             part_idx += 1;
         }
     }
@@ -182,14 +181,14 @@ fn generate_file_path(
 }
 
 /// Helper for row count demuxer
-async fn create_new_file_stream(
+fn create_new_file_stream(
     base_output_path: &ListingTableUrl,
     write_id: &str,
     part_idx: usize,
     file_extension: &str,
     single_file_output: bool,
     max_buffered_batches: usize,
-    tx: &mut Sender<(Path, Receiver<RecordBatch>)>,
+    tx: &mut UnboundedSender<(Path, Receiver<RecordBatch>)>,
 ) -> Result<Sender<RecordBatch>> {
     let file_path = generate_file_path(
         base_output_path,
@@ -199,7 +198,7 @@ async fn create_new_file_stream(
         single_file_output,
     );
     let (tx_file, rx_file) = mpsc::channel(max_buffered_batches / 2);
-    tx.send((file_path, rx_file)).await.map_err(|_| {
+    tx.send((file_path, rx_file)).map_err(|_| {
         DataFusionError::Execution("Error sending RecordBatch to file stream!".into())
     })?;
     Ok(tx_file)
@@ -209,7 +208,7 @@ async fn create_new_file_stream(
 /// Assumes standard hive style partition paths such as
 /// /col1=val1/col2=val2/outputfile.parquet
 async fn hive_style_partitions_demuxer(
-    tx: Sender<(Path, Receiver<RecordBatch>)>,
+    tx: UnboundedSender<(Path, Receiver<RecordBatch>)>,
     mut input: SendableRecordBatchStream,
     context: Arc<TaskContext>,
     partition_by: Vec<(String, DataType)>,
@@ -261,7 +260,7 @@ async fn hive_style_partitions_demuxer(
                         &base_output_path,
                     );
 
-                    tx.send((file_path, part_rx)).await.map_err(|_| {
+                    tx.send((file_path, part_rx)).map_err(|_| {
                         DataFusionError::Execution(
                             "Error sending new file stream!".into(),
                         )
