@@ -55,7 +55,7 @@ select * from validate_partitioned_parquet_bar order by col1;
 # Copy to directory as partitioned files
 query ITT
 COPY (values (1, 'a', 'x'), (2, 'b', 'y'), (3, 'c', 'z')) TO 'test_files/scratch/copy/partitioned_table2/' 
-(format parquet, compression 'zstd(10)', partition_by 'column2, column3');
+(format parquet, compression 'zstd(10)', partition_by (column2, column3));
 ----
 3
 

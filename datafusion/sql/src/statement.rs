@@ -19,8 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::parser::{
-    CopyToSource, CopyToStatement, CreateExternalTable, DFParser, ExplainStatement,
-    LexOrdering, Statement as DFStatement,
+    CopyToOptionValue, CopyToSource, CopyToStatement, CreateExternalTable, DFParser, ExplainStatement, LexOrdering, Statement as DFStatement
 };
 use crate::planner::{
     object_name_to_qualifier, ContextProvider, PlannerContext, SqlToRel,
@@ -713,8 +712,13 @@ impl<'a, S: ContextProvider> SqlToRel<'a, S> {
         let options = statement
             .options
             .iter()
-            .map(|(s, v)| (s.to_owned(), v.to_string()))
-            .collect::<Vec<(String, String)>>();
+            .map(|(s, value)| {
+                match value{
+                    CopyToOptionValue::Single(v) =>(s.to_owned(), v.to_string()),
+                    CopyToOptionValue::List(v)=>(s, v.to_owned())
+                }
+            })
+            .collect::<Vec<(_, _)>>();
 
         let mut statement_options = StatementOptions::new(options);
         let file_format = statement_options.try_infer_file_type(&statement.target)?;

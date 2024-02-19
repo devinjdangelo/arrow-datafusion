@@ -46,11 +46,16 @@ use self::{
     csv_writer::CsvWriterOptions, json_writer::JsonWriterOptions,
 };
 
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub enum OptionValue{
+    Single(String),
+    List(Vec<String>),
+}
 /// Represents a single arbitrary setting in a
 /// [StatementOptions] where OptionTuple.0 determines
 /// the specific setting to be modified and OptionTuple.1
 /// determines the value which should be applied
-pub type OptionTuple = (String, String);
+pub type OptionTuple = (String, OptionValue);
 
 /// Represents arbitrary tuples of options passed as String
 /// tuples from SQL statements. As in the following statement:
@@ -66,7 +71,7 @@ impl From<&HashMap<String, String>> for StatementOptions {
         Self {
             options: value
                 .iter()
-                .map(|(k, v)| (k.to_owned(), v.to_owned()))
+                .map(|(k, v)| (k.to_owned(), OptionValue::Single(v.to_owned())))
                 .collect::<Vec<OptionTuple>>(),
         }
     }

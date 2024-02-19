@@ -103,7 +103,32 @@ pub struct CopyToStatement {
     /// The URL to where the data is heading
     pub target: String,
     /// Target specific options
-    pub options: Vec<(String, Value)>,
+    pub options: Vec<(String, CopyToOptionValue)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CopyToOptionValue {
+    /// A single [Value], e.g. (format parquet)
+    Single(Value),
+    /// A list of [Value]s, e.g. (partition_by ("a", "b", "c"))
+    List(Vec<String>),
+}
+
+impl fmt::Display for CopyToOptionValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self {
+            CopyToOptionValue::Single(val) => write!(f, "{val}")?,
+            CopyToOptionValue::List(vals) => write!(
+                f,
+                "({})",
+                vals.iter()
+                    .map(|v| v.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )?,
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Display for CopyToStatement {
@@ -336,7 +361,7 @@ impl<'a> DFParser<'a> {
                         self.parse_copy()
                     }
                     Keyword::EXPLAIN => {
-                        // (TODO parse all supported statements)
+                        // (TODO parse all supported statements)parse_copyparse_copyparse_copy
                         self.parser.next_token(); // EXPLAIN
                         self.parse_explain()
                     }
@@ -359,6 +384,7 @@ impl<'a> DFParser<'a> {
 
     /// Parse a SQL `COPY TO` statement
     pub fn parse_copy(&mut self) -> Result<Statement, ParserError> {
+        println!("deleteme... parse_copy called");
         // parse as a query
         let source = if self.parser.consume_token(&Token::LParen) {
             let query = self.parser.parse_query()?;
@@ -411,20 +437,37 @@ impl<'a> DFParser<'a> {
     /// word or keyword in this location.
     ///
     /// [`parse_value`]: sqlparser::parser::Parser::parse_value
-    pub fn parse_option_value(&mut self) -> Result<Value, ParserError> {
-        let next_token = self.parser.next_token();
+    pub fn parse_option_value(&mut self) -> Result<CopyToOptionValue, ParserError> {
+        let next_token = self.parser.peek_token();
         match next_token.token {
-            Token::Word(Word { value, .. }) => Ok(Value::UnQuotedString(value)),
-            Token::SingleQuotedString(s) => Ok(Value::SingleQuotedString(s)),
-            Token::DoubleQuotedString(s) => Ok(Value::DoubleQuotedString(s)),
-            Token::EscapedStringLiteral(s) => Ok(Value::EscapedStringLiteral(s)),
-            Token::Number(ref n, l) => match n.parse() {
-                Ok(n) => Ok(Value::Number(n, l)),
-                // The tokenizer should have ensured `n` is an integer
-                // so this should not be possible
-                Err(e) => parser_err!(format!(
-                    "Unexpected error: could not parse '{n}' as number: {e}"
-                )),
+            Token::Word(Word { value, .. }) => {
+                self.parser.next_token();
+                Ok(CopyToOptionValue::Single(Value::UnQuotedString(value)))
+            },
+            Token::SingleQuotedString(s) => {
+                self.parser.next_token();
+                Ok(CopyToOptionValue::Single(Value::SingleQuotedString(s)))
+            },
+            Token::DoubleQuotedString(s) => {
+                self.parser.next_token();
+                Ok(CopyToOptionValue::Single(Value::DoubleQuotedString(s)))
+            },
+            Token::EscapedStringLiteral(s) => {
+                self.parser.next_token();
+                Ok(CopyToOptionValue::Single(Value::EscapedStringLiteral(s)))
+            },
+            Token::Number(ref n, l) => {
+                self.parser.next_token();
+                match n.parse() {
+                    Ok(n) => Ok(CopyToOptionValue::Single(Value::Number(n, l))),
+                    // The tokenizer should have ensured `n` is an integer
+                    // so this should not be possible
+                    Err(e) => parser_err!(format!(
+                        "Unexpected error: could not parse '{n}' as number: {e}"
+                    )),
+                }},
+            Token::LParen => {
+                Ok(CopyToOptionValue::List(self.parse_partitions()?))
             },
             _ => self.parser.expected("string or numeric value", next_token),
         }
@@ -457,13 +500,19 @@ impl<'a> DFParser<'a> {
 
     fn parse_partitions(&mut self) -> Result<Vec<String>, ParserError> {
         let mut partitions: Vec<String> = vec![];
+        println!("parse parts");
+        for i in 0..10{
+            println!("{}",self.parser.peek_nth_token(i));
+        }
         if !self.parser.consume_token(&Token::LParen)
             || self.parser.consume_token(&Token::RParen)
         {
+            println!("exit parse parts early");
             return Ok(partitions);
         }
 
         loop {
+            println!("loop parse parts");
             if let Token::Word(_) = self.parser.peek_token().token {
                 let identifier = self.parser.parse_identifier(false)?;
                 partitions.push(identifier.to_string());
@@ -781,7 +830,7 @@ impl<'a> DFParser<'a> {
     /// Unlike [`Self::parse_string_options`], this method supports
     /// keywords as key names as well as multiple value types such as
     /// Numbers as well as Strings.
-    fn parse_value_options(&mut self) -> Result<Vec<(String, Value)>, ParserError> {
+    fn parse_value_options(&mut self) -> Result<Vec<(String, CopyToOptionValue)>, ParserError> {
         let mut options = vec![];
         self.parser.expect_token(&Token::LParen)?;
 
@@ -789,6 +838,7 @@ impl<'a> DFParser<'a> {
             let key = self.parse_option_key()?;
             let value = self.parse_option_value()?;
             options.push((key, value));
+            println!("deleteme options: {options:?}");
             let comma = self.parser.consume_token(&Token::Comma);
             if self.parser.consume_token(&Token::RParen) {
                 // allow a trailing comma, even though it's not in standard
@@ -1393,7 +1443,7 @@ mod tests {
             target: "bar".to_string(),
             options: vec![(
                 "row_group_size".to_string(),
-                Value::Number("55".to_string(), false),
+                CopyToOptionValue::Single(Value::Number("55".to_string(), false)),
             )],
         });
         assert_eq!(verified_stmt(sql), expected);
@@ -1409,15 +1459,15 @@ mod tests {
         let expected_options = vec![
             (
                 "format".to_string(),
-                Value::UnQuotedString("parquet".to_string()),
+                CopyToOptionValue::Single(Value::UnQuotedString("parquet".to_string())),
             ),
             (
                 "row_group_size".to_string(),
-                Value::Number("55".to_string(), false),
+                CopyToOptionValue::Single(Value::Number("55".to_string(), false)),
             ),
             (
                 "compression".to_string(),
-                Value::UnQuotedString("snappy".to_string()),
+                CopyToOptionValue::Single(Value::UnQuotedString("snappy".to_string())),
             ),
         ];
 
